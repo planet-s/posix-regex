@@ -117,7 +117,7 @@ impl<'a> PosixRegexBuilder<'a> {
     }
     /// "Compile" this regex to a struct ready to match input
     pub fn compile(&mut self) -> Result<PosixRegex, Error> {
-        let search = self.compile_inner(true)?;
+        let search = self.compile_inner()?;
         Ok(PosixRegex {
             search
         })
@@ -149,8 +149,9 @@ impl<'a> PosixRegexBuilder<'a> {
         self.consume(1);
         Ok(())
     }
-    fn compile_inner(&mut self, toplevel: bool) -> Result<Vec<(Token, Range)>, Error> {
-        let mut search: Vec<(Token, Range)> = Vec::new();
+    fn compile_inner(&mut self) -> Result<Vec<Vec<(Token, Range)>>, Error> {
+        let mut alternatives = Vec::new();
+        let mut chain: Vec<(Token, Range)> = Vec::new();
 
         while let Some(&c) = self.input.first() {
             self.consume(1);
@@ -158,7 +159,7 @@ impl<'a> PosixRegexBuilder<'a> {
                 b'^' => Token::Start,
                 b'$' => Token::End,
                 b'.' => Token::Any,
-                b'*' => if let Some(last) = search.last_mut() {
+                b'*' => if let Some(last) = chain.last_mut() {
                     last.1 = Range(0, None);
                     continue;
                 } else {
@@ -229,70 +230,60 @@ impl<'a> PosixRegexBuilder<'a> {
                         list
                     }
                 },
-                b'\\' => match self.input.first() {
-                    None => return Err(Error::EOF),
-                    Some(b'|') | Some(b')') if !toplevel => return Ok(search),
-                    Some(&c @ b'|') | Some(&c @ b')') if toplevel => return Err(Error::UnexpectedToken(c)),
-                    Some(&c) => {
-                        self.consume(1);
-                        match c {
-                            b'(' => {
-                                let mut branches = Vec::new();
-                                loop {
-                                    let inner = self.compile_inner(false)?;
-                                    branches.push(inner);
-                                    match self.next()? {
-                                        b'|' => (),
-                                        b')' => break,
-                                        _ => unreachable!()
-                                    }
-                                }
-                                Token::Group(branches)
-                            },
-                            b'<' => Token::WordStart,
-                            b'>' => Token::WordEnd,
-                            b'?' | b'+' => if let Some(last) = search.last_mut() {
-                                last.1 = match c {
-                                    b'?' => Range(0, Some(1)),
-                                    b'+' => Range(1, None),
-                                    _ => unreachable!()
-                                };
-                                continue;
-                            } else {
-                                return Err(Error::LeadingRepetition);
-                            },
-                            b'{' => if let Some(last) = search.last_mut() {
-                                let first = self.take_int()?.ok_or(Error::EmptyRepetition)?;
-                                let mut second = Some(first);
-                                if let Some(b',') = self.input.first() {
-                                    self.consume(1);
-                                    second = self.take_int()?;
-                                }
-                                if self.input.first() == Some(&b'}') {
-                                    self.consume(1);
-                                } else if self.input.starts_with(br"\}") {
-                                    self.consume(2);
-                                } else {
-                                    return Err(Error::UnclosedRepetition);
-                                }
-                                if second.map(|second| first > second).unwrap_or(false) {
-                                    return Err(Error::IllegalRange);
-                                }
-                                last.1 = Range(first, second);
-                                continue;
-                            } else {
-                                return Err(Error::LeadingRepetition);
-                            },
-                            c => Token::Char(c)
-                        }
+                b'\\' => match self.next()? {
+                    b'(' => Token::Group(self.compile_inner()?),
+                    b')' => {
+                        alternatives.push(chain);
+                        return Ok(alternatives);
                     }
+                    b'|' => {
+                        alternatives.push(chain);
+                        chain = Vec::new();
+                        continue;
+                    },
+                    b'<' => Token::WordStart,
+                    b'>' => Token::WordEnd,
+                    c@b'?' | c@b'+' => if let Some(last) = chain.last_mut() {
+                        last.1 = match c {
+                            b'?' => Range(0, Some(1)),
+                            b'+' => Range(1, None),
+                            _ => unreachable!(c)
+                        };
+                        continue;
+                    } else {
+                        return Err(Error::LeadingRepetition);
+                    },
+                    b'{' => if let Some(last) = chain.last_mut() {
+                        let first = self.take_int()?.ok_or(Error::EmptyRepetition)?;
+                        let mut second = Some(first);
+                        if let Some(b',') = self.input.first() {
+                            self.consume(1);
+                            second = self.take_int()?;
+                        }
+                        if self.input.first() == Some(&b'}') {
+                            self.consume(1);
+                        } else if self.input.starts_with(br"\}") {
+                            self.consume(2);
+                        } else {
+                            return Err(Error::UnclosedRepetition);
+                        }
+                        if second.map(|second| first > second).unwrap_or(false) {
+                            return Err(Error::IllegalRange);
+                        }
+                        last.1 = Range(first, second);
+                        continue;
+                    } else {
+                        return Err(Error::LeadingRepetition);
+                    },
+                    c => Token::Char(c)
                 },
                 c => Token::Char(c)
             };
-            search.push((token, Range(1, Some(1))));
+            chain.push((token, Range(1, Some(1))));
         }
 
-        Ok(search)
+        alternatives.push(chain);
+        Ok(alternatives)
     }
 }
 
@@ -306,6 +297,9 @@ mod tests {
             .compile()
             .expect("error compiling regex")
             .search
+            .into_iter()
+            .next()
+            .unwrap()
     }
     fn t(t: Token) -> (Token, Range) {
         (t, Range(1, Some(1)))
