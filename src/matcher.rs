@@ -18,11 +18,11 @@ impl PosixRegex {
     /// Match the string starting at the current position. This does not find
     /// substrings.
     pub fn matches_exact(self, input: &[u8]) -> Option<PosixRegexResult> {
-        // let mut groups = Vec::new();
+        let mut groups = Vec::new();
         let mut matcher = PosixRegexMatcher {
             input,
-            offset: 0
-            // groups: &mut groups
+            offset: 0,
+            groups: &mut groups
         };
         let start = matcher.offset;
         if !matcher.matches_exact(self.search.iter().filter_map(|tokens| Branch::new(tokens)).collect()) {
@@ -32,7 +32,8 @@ impl PosixRegex {
 
         Some(PosixRegexResult {
             start,
-            end
+            end,
+            groups
         })
     }
 }
@@ -66,6 +67,7 @@ struct Branch<'a> {
     repeated: u32,
     tokens: CowRc<'a, [(Token, Range)]>,
 
+    group_ids: Rc<[usize]>,
     repeat_min: u32,
     repeat_max: Option<u32>,
     repeats: Option<Rc<Vec<Rc<Vec<(Token, Range)>>>>>,
@@ -85,6 +87,7 @@ impl<'a> Branch<'a> {
             index: 0,
             repeated: 0,
             tokens: CowRc::Borrowed(tokens),
+            group_ids: Vec::new().into(),
             repeat_min: 0,
             repeat_max: Some(0),
             repeats: None,
@@ -92,6 +95,7 @@ impl<'a> Branch<'a> {
         })
     }
     fn group(
+        group_ids: Rc<[usize]>,
         tokens: Rc<Vec<(Token, Range)>>,
         range: Range,
         repeats: Rc<Vec<Rc<Vec<(Token, Range)>>>>,
@@ -104,6 +108,7 @@ impl<'a> Branch<'a> {
             index: 0,
             repeated: 0,
             tokens: CowRc::Owned(tokens),
+            group_ids,
             repeat_min: range.0.saturating_sub(1),
             repeat_max: range.1.map(|i| i.saturating_sub(1)),
             repeats: Some(repeats),
@@ -171,43 +176,57 @@ impl<'a> Branch<'a> {
     }
 }
 
-fn expand<'a>(branches: &[Branch<'a>]) -> Vec<Branch<'a>> {
-    let mut insert = Vec::new();
-
-    for branch in branches {
-        let (ref token, range) = *branch.get_token();
-
-        if let Token::Group(ref inner) = token {
-            let repeats = Rc::new(inner.iter().cloned().map(Rc::new).collect());
-            for alternation in &*repeats {
-                if let Some(branch) = Branch::group(Rc::clone(alternation), range, Rc::clone(&repeats), branch.next_branch()) {
-                    //println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
-                    insert.push(branch);
-                }
-            }
-        }
-        if branch.repeated >= range.0 {
-            if let Some(next) = branch.next_branch() {
-                //println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
-                insert.push(next);
-            }
-            branch.add_repeats(&mut insert);
-        }
-    }
-
-    if !insert.is_empty() {
-        let mut new = expand(&insert);
-        insert.append(&mut new);
-    }
-    insert
-}
-
 struct PosixRegexMatcher<'a> {
     input: &'a [u8],
-    offset: usize
-    // TODO: groups: &'a mut Vec<(usize, usize)>
+    offset: usize,
+    groups: &'a mut Vec<(usize, usize)>
 }
 impl<'a> PosixRegexMatcher<'a> {
+    fn expand<'b>(&mut self, branches: &[Branch<'b>]) -> Vec<Branch<'b>> {
+        let mut insert = Vec::new();
+
+        for branch in branches {
+            let (ref token, range) = *branch.get_token();
+
+            if let Token::Group(ref inner) = token {
+                let group_id = self.groups.len();
+                self.groups.push((self.offset, 0));
+
+                let repeats = Rc::new(inner.iter().cloned().map(Rc::new).collect());
+
+                let mut ids = Vec::with_capacity(branch.group_ids.len() + 1);
+                ids.extend(&*branch.group_ids);
+                ids.push(group_id);
+                let ids = ids.into();
+                for alternation in &*repeats {
+                    if let Some(branch) = Branch::group(
+                        Rc::clone(&ids),
+                        Rc::clone(alternation),
+                        range,
+                        Rc::clone(&repeats),
+                        branch.next_branch()
+                    ) {
+                        //println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
+                        insert.push(branch);
+                    }
+                }
+            }
+            if branch.repeated >= range.0 {
+                if let Some(next) = branch.next_branch() {
+                    //println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
+                    insert.push(next);
+                }
+                branch.add_repeats(&mut insert);
+            }
+        }
+
+        if !insert.is_empty() {
+            let mut new = self.expand(&insert);
+            insert.append(&mut new);
+        }
+        insert
+    }
+
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
         while let Some(&next) = self.input.get(self.offset) {
             //println!();
@@ -215,7 +234,7 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut index = 0;
             let mut remove = 0;
 
-            let mut insert = expand(&branches);
+            let mut insert = self.expand(&branches);
             branches.append(&mut insert);
 
             // Whether or not all deleted branched got fully explored. This
@@ -246,8 +265,11 @@ impl<'a> PosixRegexMatcher<'a> {
                     _ => unimplemented!("TODO")
                 };
                 if !accepts || max.map(|max| branch.repeated > max).unwrap_or(false) {
-                    happy = happy && branch.is_explored();
                     //println!("-> Delete!");
+                    happy = happy && branch.is_explored();
+                    for &id in &*branch.group_ids {
+                        self.groups[id].1 = self.offset;
+                    }
                     remove += 1;
                     continue;
                 }
@@ -265,6 +287,9 @@ impl<'a> PosixRegexMatcher<'a> {
         //println!("Branches: {:?}", branches);
 
         for branch in &branches {
+            for &id in &*branch.group_ids {
+                self.groups[id].1 = self.offset;
+            }
             if branch.is_explored() {
                 return true;
             }
@@ -276,10 +301,12 @@ impl<'a> PosixRegexMatcher<'a> {
 /// A single result, including start and end bounds
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PosixRegexResult {
-    /// An offset in the original string to where the match started (inclusive)
+    /// An offset in the input string to where the match started (inclusive)
     pub start: usize,
-    /// An offset in the original string to where the match ended (exclusive)
-    pub end: usize
+    /// An offset in the input string to where the match ended (exclusive)
+    pub end: usize,
+    /// Start/end offsets in the input to where a group matched
+    pub groups: Vec<(usize, usize)>
 }
 
 #[cfg(test)]
@@ -344,8 +371,26 @@ mod tests {
     }
     #[test]
     fn offsets() {
-        assert_eq!(matches_exact("abc", "abcd"), Some(PosixRegexResult { start: 0, end: 3 }));
-        assert_eq!(matches_exact(r"[[:alpha:]]\+", "abcde12345"), Some(PosixRegexResult { start: 0, end: 5 }));
+        assert_eq!(
+            matches_exact("abc", "abcd"),
+            Some(PosixRegexResult { start: 0, end: 3, groups: vec![] })
+        );
+        assert_eq!(
+            matches_exact(r"[[:alpha:]]\+", "abcde12345"),
+            Some(PosixRegexResult { start: 0, end: 5, groups: vec![] })
+        );
+        assert_eq!(
+            matches_exact(r"a\(bc\)\+d", "abcbcd"),
+            Some(PosixRegexResult { start: 0, end: 6, groups: vec![(1, 5)] })
+        );
+        assert_eq!(
+            matches_exact(r"hello\( \(world\|universe\) :D\)\?!", "hello world :D!"),
+            Some(PosixRegexResult { start: 0, end: 15, groups: vec![(5, 14), (6, 11)] })
+        );
+        assert_eq!(
+            matches_exact(r"hello\( \(world\|universe\) :D\)\?", "hello world :D"),
+            Some(PosixRegexResult { start: 0, end: 14, groups: vec![(5, 14), (6, 11)] })
+        );
     }
     //#[test]
     //fn start_and_end() {
