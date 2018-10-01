@@ -12,5 +12,5 @@ Regex compiler:
  - Alternative syntax for word boundaries: `[[:<:]]` and `[[:>:]]`
 
 Matcher:
- - Groups (these are difficult because you can repeat them like any other token)
+ - Start/End
  - Word boundaries
