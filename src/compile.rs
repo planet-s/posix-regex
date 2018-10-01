@@ -9,7 +9,7 @@ use std::fmt;
 use ::{ctype, PosixRegex};
 
 /// Repetition bounds, for example + is (1, None), and ? is (0, Some(1))
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Range(pub u32, pub Option<u32>);
 impl fmt::Debug for Range {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

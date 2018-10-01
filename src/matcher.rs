@@ -2,6 +2,9 @@
 
 use compile::{Token, Range};
 use std::fmt;
+use std::borrow::Borrow;
+use std::ops::Deref;
+use std::rc::Rc;
 
 /// A regex matcher, ready to match stuff
 #[derive(Clone)]
@@ -31,10 +34,39 @@ impl PosixRegex {
     }
 }
 
+enum CowRc<'a, B: ToOwned + ?Sized> {
+    Borrowed(&'a B),
+    Owned(Rc<<B as ToOwned>::Owned>)
+}
+impl<'a, B: ToOwned + ?Sized> Clone for CowRc<'a, B> {
+    fn clone(&self) -> Self {
+        match self {
+            CowRc::Borrowed(inner) => CowRc::Borrowed(inner),
+            CowRc::Owned(inner) => CowRc::Owned(Rc::clone(inner)),
+        }
+    }
+}
+impl<'a, B: ToOwned + ?Sized> Deref for CowRc<'a, B> {
+    type Target = B;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            CowRc::Borrowed(borrow) => borrow,
+            CowRc::Owned(owned) => (**owned).borrow()
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Branch<'a> {
     index: usize,
     repeated: u32,
-    tokens: &'a [(Token, Range)]
+    tokens: CowRc<'a, [(Token, Range)]>,
+
+    repeat_min: u32,
+    repeat_max: Option<u32>,
+    repeats: Option<Rc<Vec<Rc<Vec<(Token, Range)>>>>>,
+    next: Option<Rc<Branch<'a>>>
 }
 impl<'a> fmt::Debug for Branch<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -49,22 +81,100 @@ impl<'a> Branch<'a> {
         Some(Self {
             index: 0,
             repeated: 0,
-            tokens
+            tokens: CowRc::Borrowed(tokens),
+            repeat_min: 0,
+            repeat_max: Some(0),
+            repeats: None,
+            next: None
+        })
+    }
+    fn group(
+        tokens: Rc<Vec<(Token, Range)>>,
+        range: Range,
+        repeats: Rc<Vec<Rc<Vec<(Token, Range)>>>>,
+        next: Option<Branch<'a>>
+    ) -> Option<Self> {
+        if tokens.is_empty() {
+            return None;
+        }
+        Some(Self {
+            index: 0,
+            repeated: 0,
+            tokens: CowRc::Owned(tokens),
+            repeat_min: range.0.saturating_sub(1),
+            repeat_max: range.1.map(|i| i.saturating_sub(1)),
+            repeats: Some(repeats),
+            next: next.map(Rc::new)
         })
     }
     fn next_branch(&self) -> Option<Self> {
-        if self.index + 1 >= self.tokens.len() {
+        if self.repeat_min > 0 {
+            // Don't add the next branch until we've repeated this one enough
             return None;
+        }
+        if self.index + 1 >= self.tokens.len() {
+            println!("next: {:?}", self.next);
+            return self.next.as_ref().map(|inner| (**inner).clone());
         }
         Some(Self {
             index: self.index + 1,
             repeated: 0,
-            tokens: self.tokens
+            ..self.clone()
         })
+    }
+    fn add_repeats(&self, branches: &mut Vec<Branch<'a>>) {
+        if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
+            println!("Don't add repeats, cuz repeat_max = {:?}", self.repeat_max);
+            return;
+        }
+        if let Some(ref repeats) = self.repeats {
+            for branch in &**repeats {
+                println!("REPEAT!");
+                branches.push(Self {
+                    index: 0,
+                    repeated: 0,
+                    repeat_min: self.repeat_min.saturating_sub(1),
+                    repeat_max: self.repeat_max.map(|max| max - 1),
+                    tokens: CowRc::Owned(Rc::clone(branch)),
+                    ..self.clone()
+                });
+            }
+        }
     }
     fn get_token(&self) -> &(Token, Range) {
         &self.tokens[self.index]
     }
+}
+
+fn expand<'a>(branches: &[Branch<'a>]) -> Vec<Branch<'a>> {
+    let mut insert = Vec::new();
+
+    for branch in branches {
+        let (ref token, range) = *branch.get_token();
+
+        if let Token::Group(ref inner) = token {
+            let repeats = Rc::new(inner.iter().cloned().map(Rc::new).collect());
+            for alternation in &*repeats {
+                if let Some(branch) = Branch::group(Rc::clone(alternation), range, Rc::clone(&repeats), branch.next_branch()) {
+                    println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
+                    insert.push(branch);
+                }
+            }
+        }
+        if branch.repeated >= range.0 {
+            if let Some(next) = branch.next_branch() {
+                println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
+                insert.push(next);
+            }
+            branch.add_repeats(&mut insert);
+        }
+    }
+
+    if !insert.is_empty() {
+        let mut new = expand(&insert);
+        insert.append(&mut new);
+    }
+    insert
 }
 
 struct PosixRegexMatcher<'a> {
@@ -81,16 +191,8 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut index = 0;
             let mut remove = 0;
 
-            for i in 0..branches.len() {
-                let branch = &branches[i];
-                let (ref token, Range(min, _)) = *branch.get_token();
-                if branch.repeated >= min {
-                    if let Some(next) = branch.next_branch() {
-                        println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
-                        branches.push(next);
-                    }
-                }
-            }
+            let mut insert = expand(&branches);
+            branches.append(&mut insert);
 
             println!("Branches: {:?}", branches);
             loop {
@@ -110,6 +212,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 let accepts = match *token {
                     Token::Any => true,
                     Token::Char(c) => next == c,
+                    Token::Group(_) => false, // <- handled separately
                     Token::OneOf { invert, ref list } => list.iter().any(|c| c.matches(next)) == !invert,
                     _ => unimplemented!("TODO")
                 };
@@ -208,6 +311,16 @@ mod tests {
         assert!(matches_exact("[[:digit:]]*d", "1234d").is_some());
         assert!(matches_exact("[[:digit:]]*d", "abcd").is_none());
     }
+    #[test]
+    fn alternations() {
+        assert!(matches_exact(r"abc\|bcd", "abc").is_some());
+        assert!(matches_exact(r"abc\|bcd", "bcd").is_some());
+        assert!(matches_exact(r"abc\|bcd", "cde").is_none());
+        assert!(matches_exact(r"[A-Z]\+\|yee", "").is_none());
+        assert!(matches_exact(r"[A-Z]\+\|yee", "HELLO").is_some());
+        assert!(matches_exact(r"[A-Z]\+\|yee", "yee").is_some());
+        assert!(matches_exact(r"[A-Z]\+\|yee", "hello").is_none());
+    }
     //#[test]
     //fn offsets() {
     //    assert_eq!(matches_exact("abc", "abcd"), Some(PosixRegexResult { start: 0, end: 3 }));
@@ -219,18 +332,27 @@ mod tests {
     //    assert!(matches_exact("abc$", "abcd").is_none());
     //    assert!(matches_exact("^bcd", "abcd").is_none());
     //}
-    //#[test]
-    //fn groups() {
-    //    assert!(matches_exact(r"\(a*\|b\|c\)d", "d").is_some());
-    //    assert!(matches_exact(r"\(a*\|b\|c\)d", "aaaad").is_some());
-    //    assert!(matches_exact(r"\(a*\|b\|c\)d", "bd").is_some());
-    //    assert!(matches_exact(r"\(a*\|b\|c\)d", "bbbbbd").is_none());
-    //}
-    //#[test]
-    //fn repeating_groups() {
-    //    assert!(matches_exact(r"\(a\|b\|c\)*d", "d").is_some());
-    //    assert!(matches_exact(r"\(a\|b\|c\)*d", "aaaad").is_some());
-    //    assert!(matches_exact(r"\(a\|b\|c\)*d", "bbbbd").is_some());
-    //    assert!(matches_exact(r"\(a\|b\|c\)*d", "aabbd").is_some());
-    //}
+    #[test]
+    fn groups() {
+        assert!(matches_exact(r"\(a*\|b\|c\)d", "d").is_some());
+        assert!(matches_exact(r"\(a*\|b\|c\)d", "aaaad").is_some());
+        assert!(matches_exact(r"\(a*\|b\|c\)d", "bd").is_some());
+        assert!(matches_exact(r"\(a*\|b\|c\)d", "bbbbbd").is_none());
+    }
+    #[test]
+    fn repeating_groups() {
+        assert!(matches_exact(r"\(a\|b\|c\)*d", "d").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)*d", "aaaad").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)*d", "bbbbd").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)*d", "aabbd").is_some());
+
+        assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "d").is_none());
+        assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "ad").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "abd").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "abcd").is_none());
+
+        assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababad").is_none());
+        assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababd").is_some());
+        assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "abad").is_none());
+    }
 }
