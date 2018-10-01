@@ -4,8 +4,8 @@
 use std::prelude::*;
 
 use compile::{Token, Range};
+use std::borrow::{Borrow, Cow};
 use std::fmt;
-use std::borrow::Borrow;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -110,6 +110,31 @@ impl<'a> Branch<'a> {
             next: next.map(Rc::new)
         })
     }
+    fn get_token(&self) -> &(Token, Range) {
+        &self.tokens[self.index]
+    }
+    /// Returns if this node is "explored" enough times,
+    /// meaning it has repeated as many times as it want to and has nowhere to go next.
+    fn is_explored(&self) -> bool {
+        let mut branch = Cow::Borrowed(self);
+
+        loop {
+            if branch.repeat_min > 0 {
+                // Did not repeat enough times!
+                return false;
+            }
+
+            let (_, Range(min, _)) = *branch.get_token();
+            if branch.repeated < min {
+                return false;
+            }
+            match branch.next_branch() {
+                Some(next) => branch = Cow::Owned(next),
+                None => break
+            }
+        }
+        true
+    }
     fn next_branch(&self) -> Option<Self> {
         if self.repeat_min > 0 {
             // Don't add the next branch until we've repeated this one enough
@@ -143,9 +168,6 @@ impl<'a> Branch<'a> {
                 });
             }
         }
-    }
-    fn get_token(&self) -> &(Token, Range) {
-        &self.tokens[self.index]
     }
 }
 
@@ -189,13 +211,17 @@ impl<'a> PosixRegexMatcher<'a> {
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
         while let Some(&next) = self.input.get(self.offset) {
             //println!();
-            self.offset += 1;
 
             let mut index = 0;
             let mut remove = 0;
 
             let mut insert = expand(&branches);
             branches.append(&mut insert);
+
+            // Whether or not all deleted branched got fully explored. This
+            // makes sure that "abc" matches "abcd", even though "d" would give
+            // a false negative.
+            let mut happy = true;
 
             //println!("Branches: {:?}", branches);
             loop {
@@ -220,6 +246,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     _ => unimplemented!("TODO")
                 };
                 if !accepts || max.map(|max| branch.repeated > max).unwrap_or(false) {
+                    happy = happy && branch.is_explored();
                     //println!("-> Delete!");
                     remove += 1;
                     continue;
@@ -229,26 +256,17 @@ impl<'a> PosixRegexMatcher<'a> {
             branches.truncate(end);
 
             if branches.is_empty() {
-                return false;
+                return happy;
             }
+
+            self.offset += 1;
         }
         //println!("Everything went successful so far, returning.");
         //println!("Branches: {:?}", branches);
 
-        for mut branch in branches {
-            loop {
-                let (ref _token, Range(min, _)) = *branch.get_token();
-                if branch.repeated < min {
-                    //println!("Token {:?} did not get explored fully ({}/{})", _token, branch.repeated, min);
-                    break;
-                }
-
-                if let Some(next) = branch.next_branch() {
-                    branch = next;
-                } else {
-                    //println!("Token {:?} *did* get explored fully", token);
-                    return true;
-                }
+        for branch in &branches {
+            if branch.is_explored() {
+                return true;
             }
         }
         false
@@ -324,11 +342,11 @@ mod tests {
         assert!(matches_exact(r"[A-Z]\+\|yee", "yee").is_some());
         assert!(matches_exact(r"[A-Z]\+\|yee", "hello").is_none());
     }
-    //#[test]
-    //fn offsets() {
-    //    assert_eq!(matches_exact("abc", "abcd"), Some(PosixRegexResult { start: 0, end: 3 }));
-    //    assert_eq!(matches_exact(r"[[:alpha:]]\+", "abcde12345"), Some(PosixRegexResult { start: 0, end: 5 }));
-    //}
+    #[test]
+    fn offsets() {
+        assert_eq!(matches_exact("abc", "abcd"), Some(PosixRegexResult { start: 0, end: 3 }));
+        assert_eq!(matches_exact(r"[[:alpha:]]\+", "abcde12345"), Some(PosixRegexResult { start: 0, end: 5 }));
+    }
     //#[test]
     //fn start_and_end() {
     //    assert!(matches_exact("^abc$", "abc").is_some());
