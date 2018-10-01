@@ -1,5 +1,8 @@
 //! The matcher: Can find substrings in a string that match any compiled regex
 
+#[cfg(feature = "no_std")]
+use std::prelude::*;
+
 use compile::{Token, Range};
 use std::fmt;
 use std::borrow::Borrow;
@@ -113,7 +116,7 @@ impl<'a> Branch<'a> {
             return None;
         }
         if self.index + 1 >= self.tokens.len() {
-            println!("next: {:?}", self.next);
+            //println!("next: {:?}", self.next);
             return self.next.as_ref().map(|inner| (**inner).clone());
         }
         Some(Self {
@@ -124,12 +127,12 @@ impl<'a> Branch<'a> {
     }
     fn add_repeats(&self, branches: &mut Vec<Branch<'a>>) {
         if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
-            println!("Don't add repeats, cuz repeat_max = {:?}", self.repeat_max);
+            //println!("Don't add repeats, cuz repeat_max = {:?}", self.repeat_max);
             return;
         }
         if let Some(ref repeats) = self.repeats {
             for branch in &**repeats {
-                println!("REPEAT!");
+                //println!("REPEAT!");
                 branches.push(Self {
                     index: 0,
                     repeated: 0,
@@ -156,14 +159,14 @@ fn expand<'a>(branches: &[Branch<'a>]) -> Vec<Branch<'a>> {
             let repeats = Rc::new(inner.iter().cloned().map(Rc::new).collect());
             for alternation in &*repeats {
                 if let Some(branch) = Branch::group(Rc::clone(alternation), range, Rc::clone(&repeats), branch.next_branch()) {
-                    println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
+                    //println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
                     insert.push(branch);
                 }
             }
         }
         if branch.repeated >= range.0 {
             if let Some(next) = branch.next_branch() {
-                println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
+                //println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
                 insert.push(next);
             }
             branch.add_repeats(&mut insert);
@@ -185,7 +188,7 @@ struct PosixRegexMatcher<'a> {
 impl<'a> PosixRegexMatcher<'a> {
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
         while let Some(&next) = self.input.get(self.offset) {
-            println!();
+            //println!();
             self.offset += 1;
 
             let mut index = 0;
@@ -194,7 +197,7 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut insert = expand(&branches);
             branches.append(&mut insert);
 
-            println!("Branches: {:?}", branches);
+            //println!("Branches: {:?}", branches);
             loop {
                 if index >= branches.len() {
                     break;
@@ -207,7 +210,7 @@ impl<'a> PosixRegexMatcher<'a> {
 
                 branch.repeated += 1;
                 let (ref token, Range(_, max)) = *branch.get_token();
-                println!("Does {:?} match {:?}?", token, next as char);
+                //println!("Does {:?} match {:?}?", token, next as char);
 
                 let accepts = match *token {
                     Token::Any => true,
@@ -217,7 +220,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     _ => unimplemented!("TODO")
                 };
                 if !accepts || max.map(|max| branch.repeated > max).unwrap_or(false) {
-                    println!("-> Delete!");
+                    //println!("-> Delete!");
                     remove += 1;
                     continue;
                 }
@@ -229,21 +232,21 @@ impl<'a> PosixRegexMatcher<'a> {
                 return false;
             }
         }
-        println!("Everything went successful so far, returning.");
-        println!("Branches: {:?}", branches);
+        //println!("Everything went successful so far, returning.");
+        //println!("Branches: {:?}", branches);
 
         for mut branch in branches {
             loop {
-                let (ref token, Range(min, _)) = *branch.get_token();
+                let (ref _token, Range(min, _)) = *branch.get_token();
                 if branch.repeated < min {
-                    println!("Token {:?} did not get explored fully ({}/{})", token, branch.repeated, min);
+                    //println!("Token {:?} did not get explored fully ({}/{})", _token, branch.repeated, min);
                     break;
                 }
 
                 if let Some(next) = branch.next_branch() {
                     branch = next;
                 } else {
-                    println!("Token {:?} *did* get explored fully", token);
+                    //println!("Token {:?} *did* get explored fully", token);
                     return true;
                 }
             }
@@ -267,7 +270,7 @@ mod tests {
     use ::PosixRegexBuilder;
 
     fn matches_exact(regex: &str, input: &str) -> Option<PosixRegexResult> {
-        println!("----- TRYING TO MATCH {:?} AND {:?}", regex, input);
+        //println!("----- TRYING TO MATCH {:?} AND {:?}", regex, input);
         PosixRegexBuilder::new(regex.as_bytes())
             .with_default_classes()
             .compile()

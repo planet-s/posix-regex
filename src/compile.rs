@@ -100,7 +100,9 @@ impl<'a> PosixRegexBuilder<'a> {
     }
     /// Add all the default collation classes, like [[:digit:]] and [[:alnum:]]
     pub fn with_default_classes(mut self) -> Self {
+        #[cfg(not(feature = "no_std"))]
         self.classes.reserve(12);
+
         self.classes.insert(b"alnum", ctype::is_alnum);
         self.classes.insert(b"alpha", ctype::is_alpha);
         self.classes.insert(b"blank", ctype::is_blank);
@@ -113,6 +115,7 @@ impl<'a> PosixRegexBuilder<'a> {
         self.classes.insert(b"space", ctype::is_space);
         self.classes.insert(b"upper", ctype::is_upper);
         self.classes.insert(b"xdigit", ctype::is_xdigit);
+
         self
     }
     /// "Compile" this regex to a struct ready to match input

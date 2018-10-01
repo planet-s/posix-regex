@@ -3,19 +3,24 @@
 #![feature(nll)]
 
 #[cfg(feature = "no_std")]
-mod std {
-    extern crate alloc;
+#[cfg_attr(test, macro_use)]
+extern crate alloc;
 
-    pub use alloc::*;
+#[cfg(feature = "no_std")]
+mod std {
     pub use core::*;
+    pub use alloc::rc;
 
     pub mod prelude {
-        pub use super::alloc::string::String;
-        pub use super::alloc::vec::Vec;
+        pub use alloc::borrow::ToOwned;
+        pub use alloc::string::String;
+        pub use alloc::vec::Vec;
+    }
+    pub mod collections {
+        pub use alloc::collections::*;
+        pub use alloc::collections::BTreeMap as HashMap;
     }
 }
-#[cfg(feature = "no_std")]
-use std::prelude::*;
 
 pub mod compile;
 pub mod ctype;
