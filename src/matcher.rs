@@ -4,9 +4,8 @@
 use std::prelude::*;
 
 use compile::{Token, Range};
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::fmt;
-use std::ops::Deref;
 use std::rc::Rc;
 
 /// A regex matcher, ready to match stuff
@@ -38,39 +37,16 @@ impl PosixRegex {
     }
 }
 
-enum CowRc<'a, B: ToOwned + ?Sized> {
-    Borrowed(&'a B),
-    Owned(Rc<<B as ToOwned>::Owned>)
-}
-impl<'a, B: ToOwned + ?Sized> Clone for CowRc<'a, B> {
-    fn clone(&self) -> Self {
-        match self {
-            CowRc::Borrowed(inner) => CowRc::Borrowed(inner),
-            CowRc::Owned(inner) => CowRc::Owned(Rc::clone(inner)),
-        }
-    }
-}
-impl<'a, B: ToOwned + ?Sized> Deref for CowRc<'a, B> {
-    type Target = B;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            CowRc::Borrowed(borrow) => borrow,
-            CowRc::Owned(owned) => (**owned).borrow()
-        }
-    }
-}
-
 #[derive(Clone)]
 struct Branch<'a> {
     index: usize,
     repeated: u32,
-    tokens: CowRc<'a, [(Token, Range)]>,
+    tokens: &'a [(Token, Range)],
+    path: Box<[(usize, usize)]>,
 
     group_ids: Rc<[usize]>,
     repeat_min: u32,
     repeat_max: Option<u32>,
-    repeats: Option<Rc<Vec<Rc<Vec<(Token, Range)>>>>>,
     next: Option<Rc<Branch<'a>>>
 }
 impl<'a> fmt::Debug for Branch<'a> {
@@ -86,19 +62,20 @@ impl<'a> Branch<'a> {
         Some(Self {
             index: 0,
             repeated: 0,
-            tokens: CowRc::Borrowed(tokens),
+            tokens: tokens,
+            path: Vec::new().into(),
+
             group_ids: Vec::new().into(),
             repeat_min: 0,
             repeat_max: Some(0),
-            repeats: None,
             next: None
         })
     }
     fn group(
+        path: Box<[(usize, usize)]>,
         group_ids: Rc<[usize]>,
-        tokens: Rc<Vec<(Token, Range)>>,
+        tokens: &'a [(Token, Range)],
         range: Range,
-        repeats: Rc<Vec<Rc<Vec<(Token, Range)>>>>,
         next: Option<Branch<'a>>
     ) -> Option<Self> {
         if tokens.is_empty() {
@@ -107,16 +84,83 @@ impl<'a> Branch<'a> {
         Some(Self {
             index: 0,
             repeated: 0,
-            tokens: CowRc::Owned(tokens),
+            tokens,
+            path,
             group_ids,
             repeat_min: range.0.saturating_sub(1),
             repeat_max: range.1.map(|i| i.saturating_sub(1)),
-            repeats: Some(repeats),
             next: next.map(Rc::new)
         })
     }
+    fn parent_tokens(&self) -> &[(Token, Range)] {
+        let mut tokens = self.tokens;
+
+        let len = self.path.len();
+        if len > 0 {
+            for &(index, variant) in &self.path[..len-1] {
+                match tokens[index] {
+                    (Token::Group(ref inner), _) => tokens = &inner[variant],
+                    _ => panic!("non-group index in path")
+                }
+            }
+        }
+
+        tokens
+    }
+    fn tokens(&self) -> &[(Token, Range)] {
+        let mut tokens = self.parent_tokens();
+
+        if let Some(&(index, variant)) = self.path.last() {
+            match tokens[index] {
+                (Token::Group(ref inner), _) => tokens = &inner[variant],
+                _ => panic!("non-group index in path")
+            }
+        }
+
+        tokens
+    }
     fn get_token(&self) -> &(Token, Range) {
-        &self.tokens[self.index]
+        &self.tokens()[self.index]
+    }
+    fn next_branch(&self) -> Option<Self> {
+        if self.repeat_min > 0 {
+            // Don't add the next branch until we've repeated this one enough
+            return None;
+        }
+        if self.index + 1 >= self.tokens().len() {
+            return self.next.as_ref().map(|inner| (**inner).clone());
+        }
+        Some(Self {
+            index: self.index + 1,
+            repeated: 0,
+            ..self.clone()
+        })
+    }
+    fn add_repeats(&self, branches: &mut Vec<Branch<'a>>) {
+        if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
+            return;
+        }
+
+        let tokens = self.parent_tokens();
+        let &(index, _) = self.path.last().expect("add_repeats called on top level");
+        match tokens[index] {
+            (Token::Group(ref repeats), _) => {
+                for alternative in 0..repeats.len() {
+                    let mut path = self.path.clone();
+                    path.last_mut().unwrap().1 = alternative;
+
+                    branches.push(Self {
+                        index: 0,
+                        path,
+                        repeated: 0,
+                        repeat_min: self.repeat_min.saturating_sub(1),
+                        repeat_max: self.repeat_max.map(|max| max - 1),
+                        ..self.clone()
+                    });
+                }
+            },
+            _ => panic!("non-group index in path")
+        }
     }
     /// Returns if this node is "explored" enough times,
     /// meaning it has repeated as many times as it want to and has nowhere to go next.
@@ -140,37 +184,6 @@ impl<'a> Branch<'a> {
         }
         true
     }
-    fn next_branch(&self) -> Option<Self> {
-        if self.repeat_min > 0 {
-            // Don't add the next branch until we've repeated this one enough
-            return None;
-        }
-        if self.index + 1 >= self.tokens.len() {
-            return self.next.as_ref().map(|inner| (**inner).clone());
-        }
-        Some(Self {
-            index: self.index + 1,
-            repeated: 0,
-            ..self.clone()
-        })
-    }
-    fn add_repeats(&self, branches: &mut Vec<Branch<'a>>) {
-        if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
-            return;
-        }
-        if let Some(ref repeats) = self.repeats {
-            for branch in &**repeats {
-                branches.push(Self {
-                    index: 0,
-                    repeated: 0,
-                    repeat_min: self.repeat_min.saturating_sub(1),
-                    repeat_max: self.repeat_max.map(|max| max - 1),
-                    tokens: CowRc::Owned(Rc::clone(branch)),
-                    ..self.clone()
-                });
-            }
-        }
-    }
 }
 
 struct PosixRegexMatcher<'a> {
@@ -190,19 +203,21 @@ impl<'a> PosixRegexMatcher<'a> {
                 let group_id = self.groups.len();
                 self.groups.push((self.offset, 0));
 
-                let repeats = Rc::new(inner.iter().cloned().map(Rc::new).collect());
-
                 let mut ids = Vec::with_capacity(branch.group_ids.len() + 1);
                 ids.extend(&*branch.group_ids);
                 ids.push(group_id);
                 let ids = ids.into();
 
-                for alternation in &*repeats {
+                for alternation in 0..inner.len() {
+                    let mut path = Vec::with_capacity(branch.path.len() + 1);
+                    path.extend(&*branch.path);
+                    path.push((branch.index, alternation));
+
                     if let Some(branch) = Branch::group(
+                        path.into(),
                         Rc::clone(&ids),
-                        Rc::clone(alternation),
+                        branch.tokens,
                         range,
-                        Rc::clone(&repeats),
                         branch.next_branch()
                     ) {
                         insert.push(branch);
