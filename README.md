@@ -8,9 +8,9 @@ Currently only supports enhanced regex.
 ## Known TODOs
 
 Regex compiler:
- - Unnamed groups
  - Alternative syntax for word boundaries: `[[:<:]]` and `[[:>:]]`
+ - Short forms of character classes, like `\d`
+ - Unnamed groups
 
 Matcher:
- - Start/End
  - Word boundaries

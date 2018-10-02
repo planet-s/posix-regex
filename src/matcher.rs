@@ -146,7 +146,6 @@ impl<'a> Branch<'a> {
             return None;
         }
         if self.index + 1 >= self.tokens.len() {
-            //println!("next: {:?}", self.next);
             return self.next.as_ref().map(|inner| (**inner).clone());
         }
         Some(Self {
@@ -228,7 +227,8 @@ impl<'a> PosixRegexMatcher<'a> {
     }
 
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
-        while let Some(&next) = self.input.get(self.offset) {
+        loop {
+            let next = self.input.get(self.offset).cloned();
             //println!();
 
             let mut index = 0;
@@ -237,10 +237,9 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut insert = self.expand(&branches);
             branches.append(&mut insert);
 
-            // Whether or not all deleted branched got fully explored. This
-            // makes sure that "abc" matches "abcd", even though "d" would give
-            // a false negative.
-            let mut happy = true;
+            // Whether or not any branch got fully explored. This means at
+            // least one path of the regex successfully completed!
+            let mut happy = false;
 
             //println!("Branches: {:?}", branches);
             loop {
@@ -253,26 +252,47 @@ impl<'a> PosixRegexMatcher<'a> {
                 let branch = &mut branches[index-remove];
                 index += 1;
 
-                branch.repeated += 1;
-                let (ref token, Range(_, max)) = *branch.get_token();
-                //println!("Does {:?} match {:?}?", token, next as char);
+                let (ref token, Range(_, mut max)) = *branch.get_token();
+                let mut token = token;
+                //println!("Does {:?} match {:?}?", token, next.map(|c| c as char));
 
-                let accepts = match *token {
-                    Token::Any => true,
-                    Token::Char(c) => next == c,
+                let mut accepts = true;
+
+                if let Token::Start = token {
+                    // Skip ahead to the next token.
+                    match branch.next_branch() {
+                        Some(next) => *branch = next,
+                        None => {
+                            remove += 1;
+                            continue;
+                        }
+                    };
+                    let (ref new_token, Range(_, new_max)) = *branch.get_token();
+                    token = new_token;
+                    max = new_max;
+
+                    accepts = self.offset == 0;
+                }
+
+                accepts = accepts && match *token {
+                    Token::Any => next.is_some(),
+                    Token::Char(c) => next == Some(c),
+                    Token::End => next.is_none(),
                     Token::Group(_) => false, // <- handled separately
-                    Token::OneOf { invert, ref list } => list.iter().any(|c| c.matches(next)) == !invert,
+                    Token::OneOf { invert, ref list } => if let Some(next) = next {
+                        list.iter().any(|c| c.matches(next)) == !invert
+                    } else { false },
                     _ => unimplemented!("TODO")
                 };
-                if !accepts || max.map(|max| branch.repeated > max).unwrap_or(false) {
-                    //println!("-> Delete!");
-                    happy = happy && branch.is_explored();
+                if !accepts || max.map(|max| branch.repeated >= max).unwrap_or(false) {
+                    happy = happy || branch.is_explored();
                     for &id in &*branch.group_ids {
                         self.groups[id].1 = self.offset;
                     }
                     remove += 1;
                     continue;
                 }
+                branch.repeated += 1;
             }
             let end = branches.len() - remove;
             branches.truncate(end);
@@ -281,20 +301,10 @@ impl<'a> PosixRegexMatcher<'a> {
                 return happy;
             }
 
-            self.offset += 1;
-        }
-        //println!("Everything went successful so far, returning.");
-        //println!("Branches: {:?}", branches);
-
-        for branch in &branches {
-            for &id in &*branch.group_ids {
-                self.groups[id].1 = self.offset;
-            }
-            if branch.is_explored() {
-                return true;
+            if next.is_some() {
+                self.offset += 1;
             }
         }
-        false
     }
 }
 
@@ -392,12 +402,17 @@ mod tests {
             Some(PosixRegexResult { start: 0, end: 14, groups: vec![(5, 14), (6, 11)] })
         );
     }
-    //#[test]
-    //fn start_and_end() {
-    //    assert!(matches_exact("^abc$", "abc").is_some());
-    //    assert!(matches_exact("abc$", "abcd").is_none());
-    //    assert!(matches_exact("^bcd", "abcd").is_none());
-    //}
+    #[test]
+    fn start_and_end() {
+        assert!(matches_exact("^abc$", "abc").is_some());
+        assert!(matches_exact("^bcd", "abcd").is_none());
+        assert!(matches_exact("abc$", "abc").is_some());
+        assert!(matches_exact("abc$", "abcd").is_none());
+
+        assert!(matches_exact(r".*\(^\|a\)c", "c").is_some());
+        assert!(matches_exact(r".*\(^\|a\)c", "ac").is_some());
+        assert!(matches_exact(r".*\(^\|a\)c", "bc").is_none());
+    }
     #[test]
     fn groups() {
         assert!(matches_exact(r"\(a*\|b\|c\)d", "d").is_some());
