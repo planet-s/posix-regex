@@ -8,19 +8,16 @@ extern crate alloc;
 
 #[cfg(feature = "no_std")]
 mod std {
-    pub use alloc::rc;
+    pub use alloc::{borrow, rc};
     pub use core::*;
 
-    pub mod borrow {
-        pub use alloc::borrow::Cow;
-        pub use core::borrow::Borrow;
-    }
     pub mod collections {
         pub use alloc::collections::*;
         pub use alloc::collections::BTreeMap as HashMap;
     }
     pub mod prelude {
         pub use alloc::borrow::ToOwned;
+        pub use alloc::boxed::Box;
         pub use alloc::string::String;
         pub use alloc::vec::Vec;
     }
