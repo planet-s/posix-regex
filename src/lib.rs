@@ -1,5 +1,6 @@
-#![cfg_attr(feature = "no_std", no_std)]
+#![cfg_attr(feature = "bench", feature(test))]
 #![cfg_attr(feature = "no_std", feature(alloc))]
+#![cfg_attr(feature = "no_std", no_std)]
 #![feature(nll)]
 
 #[cfg(feature = "no_std")]

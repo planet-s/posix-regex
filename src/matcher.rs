@@ -361,6 +361,12 @@ pub struct PosixRegexResult {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "bench")]
+    extern crate test;
+
+    #[cfg(feature = "bench")]
+    use self::test::Bencher;
+
     use super::*;
     use ::PosixRegexBuilder;
 
@@ -497,5 +503,13 @@ mod tests {
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababad").is_none());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababd").is_some());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "abad").is_none());
+    }
+
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn speeeeed(b: &mut Bencher) {
+        b.iter(|| {
+            assert!(matches_exact(r"\(\(a*\|b\|c\) test\|yee\)", "aaaaa test").is_some());
+        })
     }
 }
