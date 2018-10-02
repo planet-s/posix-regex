@@ -125,7 +125,7 @@ impl<'a> Branch<'a> {
 
         loop {
             if branch.repeat_min > 0 {
-                // Did not repeat enough times!
+                // Group did not repeat enough times!
                 return false;
             }
 
@@ -227,6 +227,11 @@ impl<'a> PosixRegexMatcher<'a> {
     }
 
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
+        // Whether or not any branch, at any point, got fully explored. This
+        // means at least one path of the regex successfully completed!
+        let mut succeeded = false;
+        let mut prev = None;
+
         loop {
             let next = self.input.get(self.offset).cloned();
             //println!();
@@ -236,10 +241,6 @@ impl<'a> PosixRegexMatcher<'a> {
 
             let mut insert = self.expand(&branches);
             branches.append(&mut insert);
-
-            // Whether or not any branch got fully explored. This means at
-            // least one path of the regex successfully completed!
-            let mut happy = false;
 
             //println!("Branches: {:?}", branches);
             loop {
@@ -258,21 +259,38 @@ impl<'a> PosixRegexMatcher<'a> {
 
                 let mut accepts = true;
 
-                if let Token::Start = token {
-                    // Skip ahead to the next token.
-                    match branch.next_branch() {
-                        Some(next) => *branch = next,
-                        None => {
-                            remove += 1;
-                            continue;
-                        }
-                    };
-                    let (ref new_token, Range(_, new_max)) = *branch.get_token();
-                    token = new_token;
-                    max = new_max;
+                loop {
+                    match token {
+                        Token::Start |
+                        Token::WordEnd |
+                        Token::WordStart => {
+                            // Should be cheap to clone since we already make sure
+                            // it's a type that doesn't hold any data.
+                            let original = token.clone();
 
-                    accepts = self.offset == 0;
+                            // Skip ahead to the next token.
+                            match branch.next_branch() {
+                                Some(next) => *branch = next,
+                                None => break
+                            }
+                            let (ref new_token, Range(_, new_max)) = *branch.get_token();
+                            token = new_token;
+                            max = new_max;
+
+                            //println!("Or {:?}", token);
+
+                            accepts = match original {
+                                Token::Start => self.offset == 0,
+                                Token::WordEnd => next.map(::ctype::is_word_boundary).unwrap_or(true),
+                                Token::WordStart => prev.map(::ctype::is_word_boundary).unwrap_or(true),
+                                _ => unreachable!()
+                            };
+                        },
+                        _ => break
+                    }
                 }
+
+                //println!("Accepts before: {:?}", accepts);
 
                 accepts = accepts && match *token {
                     Token::Any => next.is_some(),
@@ -282,10 +300,20 @@ impl<'a> PosixRegexMatcher<'a> {
                     Token::OneOf { invert, ref list } => if let Some(next) = next {
                         list.iter().any(|c| c.matches(next)) == !invert
                     } else { false },
-                    _ => unimplemented!("TODO")
+
+                    // These will only get called if they are encountered at
+                    // EOF, for example "abc\>" or "^". Then we simply want to
+                    // return true as to preserve the current `accepts` status.
+                    Token::Start |
+                    Token::WordEnd |
+                    Token::WordStart => true
                 };
+
+                //println!("Accepts after: {:?}", accepts);
+
                 if !accepts || max.map(|max| branch.repeated >= max).unwrap_or(false) {
-                    happy = happy || branch.is_explored();
+                    succeeded = succeeded || branch.is_explored();
+                    //println!("-> Deleted! Succeeded: {}", succeeded);
                     for &id in &*branch.group_ids {
                         self.groups[id].1 = self.offset;
                     }
@@ -298,11 +326,12 @@ impl<'a> PosixRegexMatcher<'a> {
             branches.truncate(end);
 
             if branches.is_empty() {
-                return happy;
+                return succeeded;
             }
 
             if next.is_some() {
                 self.offset += 1;
+                prev = next;
             }
         }
     }
@@ -405,6 +434,7 @@ mod tests {
     #[test]
     fn start_and_end() {
         assert!(matches_exact("^abc$", "abc").is_some());
+        assert!(matches_exact("^bcd", "bcde").is_some());
         assert!(matches_exact("^bcd", "abcd").is_none());
         assert!(matches_exact("abc$", "abc").is_some());
         assert!(matches_exact("abc$", "abcd").is_none());
@@ -412,6 +442,24 @@ mod tests {
         assert!(matches_exact(r".*\(^\|a\)c", "c").is_some());
         assert!(matches_exact(r".*\(^\|a\)c", "ac").is_some());
         assert!(matches_exact(r".*\(^\|a\)c", "bc").is_none());
+
+        // Tests if ^ can be repeated without issues
+        assert!(matches_exact(".*^^a", "helloabc").is_none());
+        assert!(matches_exact(".*^^a", "abc").is_some());
+    }
+    #[test]
+    fn word_boundaries() {
+        assert!(matches_exact(r"hello\>.world", "hello world").is_some());
+        assert!(matches_exact(r"hello\>.world", "hello!world").is_some());
+        assert!(matches_exact(r"hello\>.world", "hellooworld").is_none());
+
+        assert!(matches_exact(r"hello.\<world", "hello world").is_some());
+        assert!(matches_exact(r"hello.\<world", "hello!world").is_some());
+        assert!(matches_exact(r"hello.\<world", "hellooworld").is_none());
+
+        assert!(matches_exact(r".*\<hello\>", "hihello").is_none());
+        assert!(matches_exact(r".*\<hello\>", "hi_hello").is_none());
+        assert!(matches_exact(r".*\<hello\>", "hi hello").is_some());
     }
     #[test]
     fn groups() {

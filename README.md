@@ -11,6 +11,3 @@ Regex compiler:
  - Alternative syntax for word boundaries: `[[:<:]]` and `[[:>:]]`
  - Short forms of character classes, like `\d`
  - Unnamed groups
-
-Matcher:
- - Word boundaries

@@ -34,3 +34,7 @@ pub fn is_upper(c: u8) -> bool {
 pub fn is_xdigit(c: u8) -> bool {
     is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
 }
+
+pub fn is_word_boundary(c: u8) -> bool {
+    !is_alnum(c) && c != b'_'
+}
