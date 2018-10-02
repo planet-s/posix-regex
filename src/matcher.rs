@@ -156,12 +156,10 @@ impl<'a> Branch<'a> {
     }
     fn add_repeats(&self, branches: &mut Vec<Branch<'a>>) {
         if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
-            //println!("Don't add repeats, cuz repeat_max = {:?}", self.repeat_max);
             return;
         }
         if let Some(ref repeats) = self.repeats {
             for branch in &**repeats {
-                //println!("REPEAT!");
                 branches.push(Self {
                     index: 0,
                     repeated: 0,
@@ -188,6 +186,7 @@ impl<'a> PosixRegexMatcher<'a> {
             let (ref token, range) = *branch.get_token();
 
             if let Token::Group(ref inner) = token {
+                // Push the group's inner content as a new branch
                 let group_id = self.groups.len();
                 self.groups.push((self.offset, 0));
 
@@ -197,6 +196,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 ids.extend(&*branch.group_ids);
                 ids.push(group_id);
                 let ids = ids.into();
+
                 for alternation in &*repeats {
                     if let Some(branch) = Branch::group(
                         Rc::clone(&ids),
@@ -205,14 +205,13 @@ impl<'a> PosixRegexMatcher<'a> {
                         Rc::clone(&repeats),
                         branch.next_branch()
                     ) {
-                        //println!("{:?} ---[G Cloned]--> {:?}", token, branch.get_token());
                         insert.push(branch);
                     }
                 }
             }
             if branch.repeated >= range.0 {
+                // Push the next element as a new branch
                 if let Some(next) = branch.next_branch() {
-                    //println!("{:?} ---[Cloned]--> {:?}", token, next.get_token());
                     insert.push(next);
                 }
                 branch.add_repeats(&mut insert);
@@ -220,6 +219,7 @@ impl<'a> PosixRegexMatcher<'a> {
         }
 
         if !insert.is_empty() {
+            // Resolve recursively
             let mut new = self.expand(&insert);
             insert.append(&mut new);
         }
@@ -234,7 +234,6 @@ impl<'a> PosixRegexMatcher<'a> {
 
         loop {
             let next = self.input.get(self.offset).cloned();
-            //println!();
 
             let mut index = 0;
             let mut remove = 0;
@@ -242,12 +241,13 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut insert = self.expand(&branches);
             branches.append(&mut insert);
 
-            //println!("Branches: {:?}", branches);
             loop {
                 if index >= branches.len() {
                     break;
                 }
                 if remove > 0 {
+                    // Just like Rust's `retain` function, shift all elements I
+                    // want to keep back and `truncate` when I'm done.
                     branches.swap(index, index-remove);
                 }
                 let branch = &mut branches[index-remove];
@@ -255,10 +255,10 @@ impl<'a> PosixRegexMatcher<'a> {
 
                 let (ref token, Range(_, mut max)) = *branch.get_token();
                 let mut token = token;
-                //println!("Does {:?} match {:?}?", token, next.map(|c| c as char));
 
                 let mut accepts = true;
 
+                // Step 1: Handle zero-width stuff like ^ and \<
                 loop {
                     match token {
                         Token::Start |
@@ -277,8 +277,6 @@ impl<'a> PosixRegexMatcher<'a> {
                             token = new_token;
                             max = new_max;
 
-                            //println!("Or {:?}", token);
-
                             accepts = match original {
                                 Token::Start => self.offset == 0,
                                 Token::WordEnd => next.map(::ctype::is_word_boundary).unwrap_or(true),
@@ -290,8 +288,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     }
                 }
 
-                //println!("Accepts before: {:?}", accepts);
-
+                // Step 2: Check if the token matches
                 accepts = accepts && match *token {
                     Token::Any => next.is_some(),
                     Token::Char(c) => next == Some(c),
@@ -302,24 +299,23 @@ impl<'a> PosixRegexMatcher<'a> {
                     } else { false },
 
                     // These will only get called if they are encountered at
-                    // EOF, for example "abc\>" or "^". Then we simply want to
-                    // return true as to preserve the current `accepts` status.
+                    // EOF (because next_branch returns None), for example
+                    // "abc\>" or "^". Then we simply want to return true as to
+                    // preserve the current `accepts` status.
                     Token::Start |
                     Token::WordEnd |
                     Token::WordStart => true
                 };
 
-                //println!("Accepts after: {:?}", accepts);
-
                 if !accepts || max.map(|max| branch.repeated >= max).unwrap_or(false) {
                     succeeded = succeeded || branch.is_explored();
-                    //println!("-> Deleted! Succeeded: {}", succeeded);
                     for &id in &*branch.group_ids {
                         self.groups[id].1 = self.offset;
                     }
                     remove += 1;
                     continue;
                 }
+
                 branch.repeated += 1;
             }
             let end = branches.len() - remove;
@@ -354,7 +350,6 @@ mod tests {
     use ::PosixRegexBuilder;
 
     fn matches_exact(regex: &str, input: &str) -> Option<PosixRegexResult> {
-        //println!("----- TRYING TO MATCH {:?} AND {:?}", regex, input);
         PosixRegexBuilder::new(regex.as_bytes())
             .with_default_classes()
             .compile()
@@ -429,6 +424,10 @@ mod tests {
         assert_eq!(
             matches_exact(r"hello\( \(world\|universe\) :D\)\?", "hello world :D"),
             Some(PosixRegexResult { start: 0, end: 14, groups: vec![(5, 14), (6, 11)] })
+        );
+        assert_eq!(
+            matches_exact(r"\(\<hello\>\) world", "hello world"),
+            Some(PosixRegexResult { start: 0, end: 11, groups: vec![(0, 5)] })
         );
     }
     #[test]
