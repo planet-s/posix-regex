@@ -3,28 +3,76 @@
 #[cfg(feature = "no_std")]
 use std::prelude::*;
 
+use ::ctype;
 use compile::{Token, Range};
 use std::borrow::Cow;
-use std::fmt;
 use std::rc::Rc;
+use std::{fmt, mem};
 
 /// A regex matcher, ready to match stuff
 #[derive(Clone)]
 pub struct PosixRegex {
-    pub(crate) search: Vec<Vec<(Token, Range)>>
+    branches: Vec<Vec<(Token, Range)>>,
+    case_insensitive: bool,
+    newline: bool,
+    no_start: bool,
+    no_end: bool
 }
 impl PosixRegex {
+    /// Create a new matcher instance from the specified alternations. This
+    /// should probably not be used and instead an instance should be obtained
+    /// from `PosixRegexBuilder`, which also compiles a string into regex.
+    pub fn new(branches: Vec<Vec<(Token, Range)>>) -> Self {
+        Self {
+            branches,
+            case_insensitive: false,
+            newline: false,
+            no_start: false,
+            no_end: false
+        }
+    }
+    /// Chainable function to enable/disable case insensitivity. Default: false.
+    /// When enabled, single characters match both their upper and lowercase
+    /// representations.
+    pub fn case_insensitive(mut self, value: bool) -> Self {
+        self.case_insensitive = value;
+        self
+    }
+    /// Chainable function to enable/disable newline mode. Default: false.
+    /// When enabled, ^ and $ match newlines as well as start/end.
+    /// This behavior overrides both no_start and no_end.
+    pub fn newline(mut self, value: bool) -> Self {
+        self.newline = value;
+        self
+    }
+    /// Chainable function to enable/disable no_start mode. Default: false.
+    /// When enabled, ^ doesn't actually match the start of a string.
+    pub fn no_start(mut self, value: bool) -> Self {
+        self.no_start = value;
+        self
+    }
+    /// Chainable function to enable/disable no_start mode. Default: false.
+    /// When enabled, $ doesn't actually match the end of a string.
+    pub fn no_end(mut self, value: bool) -> Self {
+        self.no_end = value;
+        self
+    }
     /// Match the string starting at the current position. This does not find
     /// substrings.
-    pub fn matches_exact(self, input: &[u8]) -> Option<PosixRegexResult> {
+    pub fn matches_exact(&self, input: &[u8]) -> Option<PosixRegexResult> {
         let mut groups = Vec::new();
         let mut matcher = PosixRegexMatcher {
+            base: self,
             input,
             offset: 0,
             groups: &mut groups
         };
+        let branches = self.branches.iter()
+            .filter_map(|tokens| Branch::new(tokens))
+            .collect();
+
         let start = matcher.offset;
-        if !matcher.matches_exact(self.search.iter().filter_map(|tokens| Branch::new(tokens)).collect()) {
+        if !matcher.matches_exact(branches) {
             return None;
         }
         let end = matcher.offset;
@@ -35,6 +83,48 @@ impl PosixRegex {
             groups
         })
     }
+    /// Match any substrings in the string
+    pub fn matches(&self, input: &[u8]) -> Vec<PosixRegexResult> {
+        let mut groups = Vec::new();
+        let mut matcher = PosixRegexMatcher {
+            base: self,
+            input,
+            offset: 0,
+            groups: &mut groups
+        };
+
+        let branches: Vec<_> = self.branches.iter()
+            .map(|tokens| {
+                let mut new = Vec::with_capacity(1 + tokens.len());
+                new.push((Token::InternalStart, Range(0, None)));
+                new.extend_from_slice(tokens);
+                new
+            })
+            .collect();
+
+        let mut matches = Vec::new();
+        while matcher.matches_exact({
+            branches.iter()
+                .filter_map(|tokens| Branch::new(tokens))
+                .collect()
+        }) {
+            matches.push(PosixRegexResult {
+                start: 0,
+                end: matcher.offset,
+                groups: mem::replace(matcher.groups, Vec::new())
+            });
+        }
+        matches
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Group {
+    index: usize,
+    variant: usize,
+
+    start: usize,
+    end: usize
 }
 
 #[derive(Clone)]
@@ -42,9 +132,9 @@ struct Branch<'a> {
     index: usize,
     repeated: u32,
     tokens: &'a [(Token, Range)],
-    path: Box<[(usize, usize)]>,
+    path: Box<[Group]>,
+    prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
 
-    group_ids: Rc<[usize]>,
     repeat_min: u32,
     repeat_max: Option<u32>,
     next: Option<Rc<Branch<'a>>>
@@ -63,17 +153,17 @@ impl<'a> Branch<'a> {
             index: 0,
             repeated: 0,
             tokens: tokens,
-            path: Vec::new().into(),
+            path: Box::new([]),
+            prev: Vec::new(),
 
-            group_ids: Vec::new().into(),
             repeat_min: 0,
             repeat_max: Some(0),
             next: None
         })
     }
     fn group(
-        path: Box<[(usize, usize)]>,
-        group_ids: Rc<[usize]>,
+        path: Box<[Group]>,
+        prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
         tokens: &'a [(Token, Range)],
         range: Range,
         next: Option<Branch<'a>>
@@ -86,7 +176,7 @@ impl<'a> Branch<'a> {
             repeated: 0,
             tokens,
             path,
-            group_ids,
+            prev,
             repeat_min: range.0.saturating_sub(1),
             repeat_max: range.1.map(|i| i.saturating_sub(1)),
             next: next.map(Rc::new)
@@ -97,9 +187,9 @@ impl<'a> Branch<'a> {
 
         let len = self.path.len();
         if len > 0 {
-            for &(index, variant) in &self.path[..len-1] {
-                match tokens[index] {
-                    (Token::Group(ref inner), _) => tokens = &inner[variant],
+            for group in &self.path[..len-1] {
+                match tokens[group.index] {
+                    (Token::Group(ref inner), _) => tokens = &inner[group.variant],
                     _ => panic!("non-group index in path")
                 }
             }
@@ -110,9 +200,9 @@ impl<'a> Branch<'a> {
     fn tokens(&self) -> &[(Token, Range)] {
         let mut tokens = self.parent_tokens();
 
-        if let Some(&(index, variant)) = self.path.last() {
-            match tokens[index] {
-                (Token::Group(ref inner), _) => tokens = &inner[variant],
+        if let Some(group) = self.path.last() {
+            match tokens[group.index] {
+                (Token::Group(ref inner), _) => tokens = &inner[group.variant],
                 _ => panic!("non-group index in path")
             }
         }
@@ -122,13 +212,47 @@ impl<'a> Branch<'a> {
     fn get_token(&self) -> &(Token, Range) {
         &self.tokens()[self.index]
     }
+    fn update_group_end(&mut self, offset: usize) {
+        for group in &mut *self.path {
+            group.end = offset;
+        }
+    }
+    fn push_to_prev(&self, prev: &mut Vec<(Box<[(usize, usize)]>, (usize, usize))>) {
+        for i in 0..self.path.len() {
+            let key: Vec<_> = self.path[..=i].iter().map(|g| (g.index, g.variant)).collect();
+            let key = key.into();
+            let group = &self.path[i];
+            let value = (group.start, group.end);
+
+            if let Some(slot) = prev.iter_mut().find(|(key2, _)| key == *key2) {
+                *slot = (key, value);
+            } else {
+                prev.push((key, value));
+            }
+        }
+    }
     fn next_branch(&self) -> Option<Self> {
         if self.repeat_min > 0 {
             // Don't add the next branch until we've repeated this one enough
             return None;
         }
         if self.index + 1 >= self.tokens().len() {
-            return self.next.as_ref().map(|inner| (**inner).clone());
+            if let Some(ref next) = self.next {
+                // Group is closing, migrate previous & current groups to next.
+                let mut next = (**next).clone();
+
+                for (key, value) in &self.prev {
+                    if let Some(slot) = next.prev.iter_mut().find(|(key2, _)| key == key2) {
+                        *slot = (key.clone(), value.clone());
+                    } else {
+                        next.prev.push((key.clone(), value.clone()));
+                    }
+                }
+                self.push_to_prev(&mut next.prev);
+
+                return Some(next)
+            }
+            return None;
         }
         Some(Self {
             index: self.index + 1,
@@ -142,12 +266,12 @@ impl<'a> Branch<'a> {
         }
 
         let tokens = self.parent_tokens();
-        let &(index, _) = self.path.last().expect("add_repeats called on top level");
-        match tokens[index] {
+        let group = self.path.last().expect("add_repeats called on top level");
+        match tokens[group.index] {
             (Token::Group(ref repeats), _) => {
                 for alternative in 0..repeats.len() {
                     let mut path = self.path.clone();
-                    path.last_mut().unwrap().1 = alternative;
+                    path.last_mut().unwrap().variant = alternative;
 
                     branches.push(Self {
                         index: 0,
@@ -187,35 +311,34 @@ impl<'a> Branch<'a> {
 }
 
 struct PosixRegexMatcher<'a> {
+    base: &'a PosixRegex,
     input: &'a [u8],
     offset: usize,
     groups: &'a mut Vec<(usize, usize)>
 }
 impl<'a> PosixRegexMatcher<'a> {
-    fn expand<'b>(&mut self, branches: &[Branch<'b>]) -> Vec<Branch<'b>> {
+    fn expand<'b>(&mut self, branches: &mut [Branch<'b>]) -> Vec<Branch<'b>> {
         let mut insert = Vec::new();
 
         for branch in branches {
+            branch.update_group_end(self.offset);
+
             let (ref token, range) = *branch.get_token();
 
             if let Token::Group(ref inner) = token {
-                // Push the group's inner content as a new branch
-                let group_id = self.groups.len();
-                self.groups.push((self.offset, 0));
-
-                let mut ids = Vec::with_capacity(branch.group_ids.len() + 1);
-                ids.extend(&*branch.group_ids);
-                ids.push(group_id);
-                let ids = ids.into();
-
                 for alternation in 0..inner.len() {
                     let mut path = Vec::with_capacity(branch.path.len() + 1);
-                    path.extend(&*branch.path);
-                    path.push((branch.index, alternation));
+                    path.extend_from_slice(&branch.path);
+                    path.push(Group {
+                        index: branch.index,
+                        variant: alternation,
+                        start: self.offset,
+                        end: 0
+                    });
 
                     if let Some(branch) = Branch::group(
                         path.into(),
-                        Rc::clone(&ids),
+                        branch.prev.clone(),
                         branch.tokens,
                         range,
                         branch.next_branch()
@@ -235,7 +358,7 @@ impl<'a> PosixRegexMatcher<'a> {
 
         if !insert.is_empty() {
             // Resolve recursively
-            let mut new = self.expand(&insert);
+            let mut new = self.expand(&mut insert);
             insert.append(&mut new);
         }
         insert
@@ -244,8 +367,8 @@ impl<'a> PosixRegexMatcher<'a> {
     fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
         // Whether or not any branch, at any point, got fully explored. This
         // means at least one path of the regex successfully completed!
-        let mut succeeded = false;
-        let mut prev = None;
+        let mut succeeded = None;
+        let mut prev = self.offset.checked_sub(1).and_then(|index| self.input.get(index).cloned());
 
         loop {
             let next = self.input.get(self.offset).cloned();
@@ -253,7 +376,7 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut index = 0;
             let mut remove = 0;
 
-            let mut insert = self.expand(&branches);
+            let mut insert = self.expand(&mut branches);
             branches.append(&mut insert);
 
             loop {
@@ -276,12 +399,21 @@ impl<'a> PosixRegexMatcher<'a> {
                 // Step 1: Handle zero-width stuff like ^ and \<
                 loop {
                     match token {
+                        Token::End |
                         Token::Start |
                         Token::WordEnd |
                         Token::WordStart => {
-                            // Should be cheap to clone since we already make sure
-                            // it's a type that doesn't hold any data.
-                            let original = token.clone();
+                            accepts = accepts && match token {
+                                Token::End =>
+                                    (!self.base.no_end && next.is_none())
+                                        || (self.base.newline && next == Some(b'\n')),
+                                Token::Start =>
+                                    (!self.base.no_start && self.offset == 0)
+                                        || (self.base.newline && prev == Some(b'\n')),
+                                Token::WordEnd => next.map(ctype::is_word_boundary).unwrap_or(true),
+                                Token::WordStart => prev.map(ctype::is_word_boundary).unwrap_or(true),
+                                _ => unreachable!()
+                            };
 
                             // Skip ahead to the next token.
                             match branch.next_branch() {
@@ -291,13 +423,6 @@ impl<'a> PosixRegexMatcher<'a> {
                             let (ref new_token, Range(_, new_max)) = *branch.get_token();
                             token = new_token;
                             max = new_max;
-
-                            accepts = match original {
-                                Token::Start => self.offset == 0,
-                                Token::WordEnd => next.map(::ctype::is_word_boundary).unwrap_or(true),
-                                Token::WordStart => prev.map(::ctype::is_word_boundary).unwrap_or(true),
-                                _ => unreachable!()
-                            };
                         },
                         _ => break
                     }
@@ -305,27 +430,33 @@ impl<'a> PosixRegexMatcher<'a> {
 
                 // Step 2: Check if the token matches
                 accepts = accepts && match *token {
-                    Token::Any => next.is_some(),
-                    Token::Char(c) => next == Some(c),
-                    Token::End => next.is_none(),
+                    Token::InternalStart => next.is_some(),
+
+                    Token::Any => next.map(|c| !self.base.newline || c != b'\n').unwrap_or(false),
+                    Token::Char(c) => if self.base.case_insensitive {
+                        next.map(|c2| c & !32 == c2 & !32).unwrap_or(false)
+                    } else {
+                        next == Some(c)
+                    },
                     Token::Group(_) => false, // <- handled separately
                     Token::OneOf { invert, ref list } => if let Some(next) = next {
-                        list.iter().any(|c| c.matches(next)) == !invert
+                        (!invert || !self.base.newline || next != b'\n')
+                        && list.iter().any(|c| c.matches(next, self.base.case_insensitive)) == !invert
                     } else { false },
 
                     // These will only get called if they are encountered at
                     // EOF (because next_branch returns None), for example
                     // "abc\>" or "^". Then we simply want to return true as to
                     // preserve the current `accepts` status.
+                    Token::End |
                     Token::Start |
                     Token::WordEnd |
                     Token::WordStart => true
                 };
 
                 if !accepts || max.map(|max| branch.repeated >= max).unwrap_or(false) {
-                    succeeded = succeeded || branch.is_explored();
-                    for &id in &*branch.group_ids {
-                        self.groups[id].1 = self.offset;
+                    if branch.is_explored() {
+                        succeeded = Some(branch.clone());
                     }
                     remove += 1;
                     continue;
@@ -336,8 +467,19 @@ impl<'a> PosixRegexMatcher<'a> {
             let end = branches.len() - remove;
             branches.truncate(end);
 
-            if branches.is_empty() {
-                return succeeded;
+            if branches.is_empty() ||
+                    // The internal start thing is lazy, not greedy:
+                    (succeeded.is_some() && branches.iter().all(|t| t.get_token().0 == Token::InternalStart)) {
+                if let Some(ref branch) = succeeded {
+                    // Push the bounds of all successful groups
+                    let mut prev = branch.prev.clone();
+                    branch.push_to_prev(&mut prev);
+
+                    for &(ref key, group) in &prev {
+                        self.groups.push(group);
+                    }
+                }
+                return succeeded.is_some();
             }
 
             if next.is_some() {
@@ -370,11 +512,18 @@ mod tests {
     use super::*;
     use ::PosixRegexBuilder;
 
-    fn matches_exact(regex: &str, input: &str) -> Option<PosixRegexResult> {
+    fn compile(regex: &str) -> PosixRegex {
         PosixRegexBuilder::new(regex.as_bytes())
             .with_default_classes()
             .compile()
             .expect("error compiling regex")
+    }
+    fn matches(regex: &str, input: &str) -> Vec<PosixRegexResult> {
+        compile(regex)
+            .matches(input.as_bytes())
+    }
+    fn matches_exact(regex: &str, input: &str) -> Option<PosixRegexResult> {
+        compile(regex)
             .matches_exact(input.as_bytes())
     }
 
@@ -450,6 +599,18 @@ mod tests {
             matches_exact(r"\(\<hello\>\) world", "hello world"),
             Some(PosixRegexResult { start: 0, end: 11, groups: vec![(0, 5)] })
         );
+        assert_eq!(
+            matches_exact(r".*d", "hid howd ared youd"),
+            Some(PosixRegexResult { start: 0, end: 18, groups: vec![] })
+        );
+        assert_eq!(
+            matches_exact(r".*\(a\)", "bbbbba"),
+            Some(PosixRegexResult { start: 0, end: 6, groups: vec![(5, 6)] })
+        );
+        assert_eq!(
+            matches_exact(r"\(a \(b\) \(c\)\) \(d\)", "a b c d"),
+            Some(PosixRegexResult { start: 0, end: 7, groups: vec![(0, 5), (2, 3), (4, 5), (6, 7)] })
+        );
     }
     #[test]
     fn start_and_end() {
@@ -504,12 +665,52 @@ mod tests {
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababd").is_some());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "abad").is_none());
     }
+    #[test]
+    fn case_insensitive() {
+        assert!(compile(r"abc[de]")
+            .case_insensitive(true)
+            .matches_exact(b"ABCD")
+            .is_some());
+        assert!(compile(r"abc[de]")
+            .case_insensitive(true)
+            .matches_exact(b"ABCF")
+            .is_none());
+    }
+    #[test]
+    fn newline() {
+        assert!(compile(r"^hello$")
+            .newline(true)
+            .matches(b"hi\nhello\ngreetings")
+            .len() == 1);
+        assert!(compile(r"^hello$")
+            .newline(true)
+            .matches(b"hi\ngood day\ngreetings")
+            .is_empty());
+    }
+    #[test]
+    fn no_start_end() {
+        assert!(compile(r"^hello")
+            .no_start(true)
+            .matches_exact(b"hello")
+            .is_none());
+        assert!(compile(r"hello$")
+            .no_end(true)
+            .matches_exact(b"hello")
+            .is_none());
+    }
 
     #[cfg(feature = "bench")]
     #[bench]
-    fn speeeeed(b: &mut Bencher) {
+    fn speed_matches_exact(b: &mut Bencher) {
         b.iter(|| {
             assert!(matches_exact(r"\(\(a*\|b\|c\) test\|yee\)", "aaaaa test").is_some());
+        })
+    }
+    #[cfg(feature = "bench")]
+    #[bench]
+    fn speed_matches(b: &mut Bencher) {
+        b.iter(|| {
+            assert!(matches(r"\(\(a*\|b\|c\) test\|yee\)", "oooo aaaaa test").len() == 1);
         })
     }
 }

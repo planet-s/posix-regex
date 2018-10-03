@@ -28,8 +28,9 @@ pub enum Collation {
 }
 impl Collation {
     /// Compare this collation to a character
-    pub fn matches(&self, other: u8) -> bool {
+    pub fn matches(&self, other: u8, insensitive: bool) -> bool {
         match *self {
+            Collation::Char(me) if insensitive => me & !32 == other & !32,
             Collation::Char(me) => me == other,
             Collation::Class(f) => f(other)
         }
@@ -39,6 +40,8 @@ impl Collation {
 /// A single "compiled" token, such as a `.` or a character literal
 #[derive(Clone, PartialEq, Eq)]
 pub enum Token {
+    InternalStart,
+
     Any,
     Char(u8),
     End,
@@ -54,6 +57,8 @@ pub enum Token {
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            Token::InternalStart => write!(f, "<START>"),
+
             Token::Any => write!(f, "."),
             Token::Char(c) => write!(f, "{:?}", c as char),
             Token::End => write!(f, "$"),
@@ -120,10 +125,8 @@ impl<'a> PosixRegexBuilder<'a> {
     }
     /// "Compile" this regex to a struct ready to match input
     pub fn compile(&mut self) -> Result<PosixRegex, Error> {
-        let search = self.compile_inner()?;
-        Ok(PosixRegex {
-            search
-        })
+        let search = self.compile_tokens()?;
+        Ok(PosixRegex::new(search))
     }
 
     fn consume(&mut self, amount: usize) {
@@ -152,7 +155,7 @@ impl<'a> PosixRegexBuilder<'a> {
         self.consume(1);
         Ok(())
     }
-    fn compile_inner(&mut self) -> Result<Vec<Vec<(Token, Range)>>, Error> {
+    pub fn compile_tokens(&mut self) -> Result<Vec<Vec<(Token, Range)>>, Error> {
         let mut alternatives = Vec::new();
         let mut chain: Vec<(Token, Range)> = Vec::new();
 
@@ -234,7 +237,7 @@ impl<'a> PosixRegexBuilder<'a> {
                     }
                 },
                 b'\\' => match self.next()? {
-                    b'(' => Token::Group(self.compile_inner()?),
+                    b'(' => Token::Group(self.compile_tokens()?),
                     b')' => {
                         alternatives.push(chain);
                         return Ok(alternatives);
@@ -278,6 +281,13 @@ impl<'a> PosixRegexBuilder<'a> {
                     } else {
                         return Err(Error::LeadingRepetition);
                     },
+                    b'a' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_alnum)] },
+                    b'd' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_digit)] },
+                    b's' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_space)] },
+                    b'S' => Token::OneOf { invert: true,  list: vec![Collation::Class(ctype::is_space)] },
+                    b'n' => Token::Char(b'\n'),
+                    b'r' => Token::Char(b'\r'),
+                    b't' => Token::Char(b'\t'),
                     c => Token::Char(c)
                 },
                 c => Token::Char(c)
@@ -297,9 +307,8 @@ mod tests {
     fn compile(input: &[u8]) -> Vec<(Token, Range)> {
         PosixRegexBuilder::new(input)
             .with_default_classes()
-            .compile()
+            .compile_tokens()
             .expect("error compiling regex")
-            .search
             .into_iter()
             .next()
             .unwrap()
@@ -443,6 +452,13 @@ mod tests {
                     Collation::Class(ctype::is_upper)
                 ] })
             ]
+        );
+    }
+    #[test]
+    fn newline() {
+        assert_eq!(
+            compile(br"\r\n"),
+            &[c(b'\r'), c(b'\n')]
         );
     }
 }
