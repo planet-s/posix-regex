@@ -4,7 +4,7 @@
 #![feature(nll)]
 
 #[cfg(feature = "no_std")]
-#[cfg_attr(test, macro_use)]
+#[macro_use]
 extern crate alloc;
 
 #[cfg(feature = "no_std")]

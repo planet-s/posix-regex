@@ -475,7 +475,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     let mut prev = branch.prev.clone();
                     branch.push_to_prev(&mut prev);
 
-                    for &(ref key, group) in &prev {
+                    for &(_, group) in &prev {
                         self.groups.push(group);
                     }
                 }
@@ -518,6 +518,7 @@ mod tests {
             .compile()
             .expect("error compiling regex")
     }
+    #[cfg(feature = "bench")]
     fn matches(regex: &str, input: &str) -> Vec<PosixRegexResult> {
         compile(regex)
             .matches(input.as_bytes())
