@@ -4,9 +4,10 @@
 #[cfg(feature = "no_std")]
 use std::prelude::*;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use ::{ctype, PosixRegex};
+use {ctype, PosixRegex};
 
 /// Repetition bounds, for example + is (1, None), and ? is (0, Some(1))
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20,7 +21,7 @@ impl fmt::Debug for Range {
     }
 }
 
-/// An item inside square brackets, like [abc] or [[:digit:]]
+/// An item inside square brackets, like `[abc]` or `[[:digit:]]`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Collation {
     Char(u8),
@@ -98,12 +99,12 @@ impl<'a> PosixRegexBuilder<'a> {
             classes: HashMap::new()
         }
     }
-    /// Add a custom collation class, for use within square brackets (such as [[:digit:]])
+    /// Add a custom collation class, for use within square brackets (such as `[[:digit:]]`)
     pub fn with_class(mut self, name: &'a [u8], callback: fn(u8) -> bool) -> Self {
         self.classes.insert(name, callback);
         self
     }
-    /// Add all the default collation classes, like [[:digit:]] and [[:alnum:]]
+    /// Add all the default collation classes, like `[[:digit:]]` and `[[:alnum:]]`
     pub fn with_default_classes(mut self) -> Self {
         #[cfg(not(feature = "no_std"))]
         self.classes.reserve(12);
@@ -124,9 +125,9 @@ impl<'a> PosixRegexBuilder<'a> {
         self
     }
     /// "Compile" this regex to a struct ready to match input
-    pub fn compile(&mut self) -> Result<PosixRegex, Error> {
+    pub fn compile(&mut self) -> Result<PosixRegex<'static>, Error> {
         let search = self.compile_tokens()?;
-        Ok(PosixRegex::new(search))
+        Ok(PosixRegex::new(Cow::Owned(search)))
     }
 
     fn consume(&mut self, amount: usize) {
