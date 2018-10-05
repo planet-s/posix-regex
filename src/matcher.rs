@@ -667,11 +667,11 @@ mod tests {
     fn newline() {
         assert!(compile(r"^hello$")
             .newline(true)
-            .matches(b"hi\nhello\ngreetings")
+            .matches(b"hi\nhello\ngreetings", None)
             .len() == 1);
         assert!(compile(r"^hello$")
             .newline(true)
-            .matches(b"hi\ngood day\ngreetings")
+            .matches(b"hi\ngood day\ngreetings", None)
             .is_empty());
     }
     #[test]
@@ -697,7 +697,7 @@ mod tests {
     #[bench]
     fn speed_matches(b: &mut Bencher) {
         b.iter(|| {
-            assert!(matches(r"\(\(a*\|b\|c\) test\|yee\)", "oooo aaaaa test").len() == 1);
+            assert!(matches(r"\(\(a*\|b\|c\) test\|yee\)", "oooo aaaaa test", None).len() == 1);
         })
     }
 }
