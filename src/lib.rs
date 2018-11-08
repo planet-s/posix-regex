@@ -13,7 +13,7 @@ mod std {
     pub use core::*;
 
     pub mod collections {
-        pub use alloc::btree_map::BTreeMap as HashMap;
+        pub use alloc::collections::BTreeMap as HashMap;
     }
     pub mod prelude {
         pub use alloc::borrow::ToOwned;
