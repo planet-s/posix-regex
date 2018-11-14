@@ -6,8 +6,8 @@ use std::prelude::*;
 use compile::{Token, Range};
 use ctype;
 use std::borrow::Cow;
+use std::fmt;
 use std::rc::Rc;
-use std::{fmt, mem};
 
 /// A regex matcher, ready to match stuff
 #[derive(Clone)]
@@ -68,34 +68,32 @@ impl<'a> PosixRegex<'a> {
     }
     /// Match the string starting at the current position. This does not find
     /// substrings.
-    pub fn matches_exact(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
-        let mut groups = Vec::new();
+    pub fn matches_exact(&self, input: &[u8]) -> Option<Box<[Option<(usize, usize)>]>> {
         let mut matcher = PosixRegexMatcher {
             base: self,
             input,
-            offset: 0,
-            groups: &mut groups
+            offset: 0
         };
         let branches = self.branches.iter()
-            .filter_map(|tokens| Branch::new(tokens))
+            .filter_map(|tokens| Branch::new(true, tokens))
             .collect();
 
-        matcher.groups.push(Some((matcher.offset, 0)));
-        if !matcher.matches_exact(branches) {
-            return None;
+        let start = matcher.offset;
+        match matcher.matches_exact(branches) {
+            None => None,
+            Some(mut groups) => {
+                assert_eq!(groups[0], None);
+                groups[0] = Some((start, matcher.offset));
+                Some(groups)
+            }
         }
-        groups[0].as_mut().unwrap().1 = matcher.offset;
-
-        Some(groups)
     }
     /// Match any substrings in the string, but optionally no more than `max`
-    pub fn matches(&self, input: &[u8], mut max: Option<usize>) -> Vec<Vec<Option<(usize, usize)>>> {
-        let mut groups = Vec::new();
+    pub fn matches(&self, input: &[u8], mut max: Option<usize>) -> Vec<Box<[Option<(usize, usize)>]>> {
         let mut matcher = PosixRegexMatcher {
             base: self,
             input,
-            offset: 0,
-            groups: &mut groups
+            offset: 0
         };
 
         let tokens = vec![
@@ -103,12 +101,15 @@ impl<'a> PosixRegex<'a> {
             (Token::Group { id: 0, branches: self.branches.to_vec() }, Range(1, Some(1)))
         ];
         let branches = vec![
-            Branch::new(&tokens).unwrap()
+            Branch::new(false, &tokens).unwrap()
         ];
 
         let mut matches = Vec::new();
-        while max.map(|max| max > 0).unwrap_or(true) && matcher.matches_exact(branches.clone()) {
-            matches.push(mem::replace(matcher.groups, Vec::new()));
+        while max.map(|max| max > 0).unwrap_or(true) {
+            match matcher.matches_exact(branches.clone()) {
+                Some(groups) => matches.push(groups),
+                None => break
+            }
             max = max.map(|max| max - 1);
         }
         matches
@@ -154,7 +155,7 @@ impl<'a> fmt::Debug for Branch<'a> {
     }
 }
 impl<'a> Branch<'a> {
-    fn new(tokens: &'a [(Token, Range)]) -> Option<Self> {
+    fn new(exact: bool, tokens: &'a [(Token, Range)]) -> Option<Self> {
         if tokens.is_empty() {
             return None;
         }
@@ -163,7 +164,7 @@ impl<'a> Branch<'a> {
             repeated: 0,
             tokens: tokens,
             path: Box::new([]),
-            prev: vec![None; count_groups(tokens)].into_boxed_slice(),
+            prev: vec![None; if exact { 1 } else { 0 } + count_groups(tokens)].into_boxed_slice(),
 
             parent: None
         })
@@ -321,8 +322,7 @@ impl<'a> Branch<'a> {
 struct PosixRegexMatcher<'a> {
     base: &'a PosixRegex<'a>,
     input: &'a [u8],
-    offset: usize,
-    groups: &'a mut Vec<Option<(usize, usize)>>
+    offset: usize
 }
 impl<'a> PosixRegexMatcher<'a> {
     fn expand<'b>(&mut self, branches: &mut [Branch<'b>]) -> Vec<Branch<'b>> {
@@ -372,7 +372,7 @@ impl<'a> PosixRegexMatcher<'a> {
         insert
     }
 
-    fn matches_exact(&mut self, mut branches: Vec<Branch>) -> bool {
+    fn matches_exact(&mut self, mut branches: Vec<Branch>) -> Option<Box<[Option<(usize, usize)>]>> {
         // Whether or not any branch, at any point, got fully explored. This
         // means at least one path of the regex successfully completed!
         let mut succeeded = None;
@@ -481,10 +481,7 @@ impl<'a> PosixRegexMatcher<'a> {
             if branches.is_empty() ||
                     // The internal start thing is lazy, not greedy:
                     (succeeded.is_some() && branches.iter().all(|t| t.get_token().0 == Token::InternalStart)) {
-                if let Some(ref branch) = succeeded {
-                    self.groups.extend(branch.prev.into_iter());
-                }
-                return succeeded.is_some();
+                return succeeded.map(|branch| branch.prev);
             }
 
             if next.is_some() {
@@ -506,17 +503,29 @@ mod tests {
     use super::*;
     use ::PosixRegexBuilder;
 
+    // FIXME: Workaround to coerce a Box<[T; N]> into a Box<[T]>. Use type
+    // ascription when stabilized.
+    fn boxed_slice<T>(slice: Box<[T]>) -> Box<[T]> {
+        slice
+    }
+
+    macro_rules! abox {
+        ($($item:expr),*) => {
+            boxed_slice(Box::new([$($item),*]))
+        }
+    }
+
     fn compile(regex: &str) -> PosixRegex {
         PosixRegexBuilder::new(regex.as_bytes())
             .with_default_classes()
             .compile()
             .expect("error compiling regex")
     }
-    fn matches(regex: &str, input: &str) -> Vec<Vec<Option<(usize, usize)>>> {
+    fn matches(regex: &str, input: &str) -> Vec<Box<[Option<(usize, usize)>]>> {
         compile(regex)
             .matches(input.as_bytes(), None)
     }
-    fn matches_exact(regex: &str, input: &str) -> Option<Vec<Option<(usize, usize)>>> {
+    fn matches_exact(regex: &str, input: &str) -> Option<Box<[Option<(usize, usize)>]>> {
         compile(regex)
             .matches_exact(input.as_bytes())
     }
@@ -574,63 +583,63 @@ mod tests {
     fn offsets() {
         assert_eq!(
             matches_exact("abc", "abcd"),
-            Some(vec![Some((0, 3))])
+            Some(abox![Some((0, 3))])
         );
         assert_eq!(
             matches_exact(r"[[:alpha:]]\+", "abcde12345"),
-            Some(vec![Some((0, 5))])
+            Some(abox![Some((0, 5))])
         );
         assert_eq!(
             matches_exact(r"a\(bc\)\+d", "abcbcd"),
-            Some(vec![Some((0, 6)), Some((3, 5))])
+            Some(abox![Some((0, 6)), Some((3, 5))])
         );
         assert_eq!(
             matches_exact(r"hello\( \(world\|universe\) :D\)\?!", "hello world :D!"),
-            Some(vec![Some((0, 15)), Some((5, 14)), Some((6, 11))])
+            Some(abox![Some((0, 15)), Some((5, 14)), Some((6, 11))])
         );
         assert_eq!(
             matches_exact(r"hello\( \(world\|universe\) :D\)\?", "hello world :D"),
-            Some(vec![Some((0, 14)), Some((5, 14)), Some((6, 11))])
+            Some(abox![Some((0, 14)), Some((5, 14)), Some((6, 11))])
         );
         assert_eq!(
             matches_exact(r"\(\<hello\>\) world", "hello world"),
-            Some(vec![Some((0, 11)), Some((0, 5))])
+            Some(abox![Some((0, 11)), Some((0, 5))])
         );
         assert_eq!(
             matches_exact(r".*d", "hid howd ared youd"),
-            Some(vec![Some((0, 18))])
+            Some(abox![Some((0, 18))])
         );
         assert_eq!(
             matches_exact(r".*\(a\)", "bbbbba"),
-            Some(vec![Some((0, 6)), Some((5, 6))])
+            Some(abox![Some((0, 6)), Some((5, 6))])
         );
         assert_eq!(
             matches_exact(r"\(a \(b\) \(c\)\) \(d\)", "a b c d"),
-            Some(vec![Some((0, 7)), Some((0, 5)), Some((2, 3)), Some((4, 5)), Some((6, 7))])
+            Some(abox![Some((0, 7)), Some((0, 5)), Some((2, 3)), Some((4, 5)), Some((6, 7))])
         );
         assert_eq!(
             matches_exact(r"\(.\)*", "hello"),
-            Some(vec![Some((0, 5)), Some((4, 5))])
+            Some(abox![Some((0, 5)), Some((4, 5))])
         );
         assert_eq!(
-            matches("hi", "hello hi lol"),
-            vec!(vec![Some((6, 8))])
+            matches(r"h\(i\)", "hello hi lol"),
+            vec!(abox![Some((6, 8)), Some((7, 8))])
         );
         assert_eq!(
             matches_exact(r"\(\([[:alpha:]]\)*\)", "abcdefg"),
-            Some(vec![Some((0, 7)), Some((0, 7)), Some((6, 7))])
+            Some(abox![Some((0, 7)), Some((0, 7)), Some((6, 7))])
         );
         assert_eq!(
             matches_exact(r"\(\.\([[:alpha:]]\)\)*", ".a.b.c.d.e.f.g"),
-            Some(vec![Some((0, 14)), Some((12, 14)), Some((13, 14))])
+            Some(abox![Some((0, 14)), Some((12, 14)), Some((13, 14))])
         );
         assert_eq!(
             matches_exact(r"\(a\|\(b\)\)*\(c\)", "bababac"),
-            Some(vec![Some((0, 7)), Some((5, 6)), Some((4, 5)), Some((6, 7))])
+            Some(abox![Some((0, 7)), Some((5, 6)), Some((4, 5)), Some((6, 7))])
         );
         assert_eq!(
             matches_exact(r"\(a\|\(b\)\)*\(c\)", "aaac"),
-            Some(vec![Some((0, 4)), Some((2, 3)), None, Some((3, 4))])
+            Some(abox![Some((0, 4)), Some((2, 3)), None, Some((3, 4))])
         );
     }
     #[test]

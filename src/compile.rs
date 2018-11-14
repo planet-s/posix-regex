@@ -101,7 +101,7 @@ impl<'a> PosixRegexBuilder<'a> {
         Self {
             input,
             classes: HashMap::new(),
-            group_id: 0
+            group_id: 1
         }
     }
     /// Add a custom collation class, for use within square brackets (such as `[[:digit:]]`)
@@ -339,15 +339,15 @@ mod tests {
     }
     #[test]
     fn groups() {
-        assert_eq!(compile(br"\(abc\|bcd\|cde\)"), &[t(Token::Group { id: 0, branches: vec![
+        assert_eq!(compile(br"\(abc\|bcd\|cde\)"), &[t(Token::Group { id: 1, branches: vec![
             vec![c(b'a'), c(b'b'), c(b'c')],
             vec![c(b'b'), c(b'c'), c(b'd')],
             vec![c(b'c'), c(b'd'), c(b'e')]
         ]})]);
         assert_eq!(compile(br"\(abc\|\(bcd\|cde\)\)"), &[
-            t(Token::Group { id: 0, branches: vec![
+            t(Token::Group { id: 1, branches: vec![
                 vec![c(b'a'), c(b'b'), c(b'c')],
-                vec![t(Token::Group { id: 1, branches: vec![
+                vec![t(Token::Group { id: 2, branches: vec![
                     vec![c(b'b'), c(b'c'), c(b'd')],
                     vec![c(b'c'), c(b'd'), c(b'e')]
                 ]})]
