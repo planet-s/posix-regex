@@ -123,13 +123,14 @@ struct Branch<'a> {
     path: Box<[Group]>,
     prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
 
-    repeat_min: u32,
-    repeat_max: Option<u32>,
-    next: Option<Rc<Branch<'a>>>
+    parent: Option<Rc<Branch<'a>>>
 }
 impl<'a> fmt::Debug for Branch<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self.get_token())
+        let (ref token, mut range) = *self.get_token();
+        range.0 = range.0.saturating_sub(self.repeated);
+        range.1 = range.1.map(|max| max.saturating_sub(self.repeated));
+        write!(f, "{:?}", (token, range))
     }
 }
 impl<'a> Branch<'a> {
@@ -144,30 +145,26 @@ impl<'a> Branch<'a> {
             path: Box::new([]),
             prev: Vec::new(),
 
-            repeat_min: 0,
-            repeat_max: Some(0),
-            next: None
+            parent: None
         })
     }
     fn group(
         path: Box<[Group]>,
         prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
         tokens: &'a [(Token, Range)],
-        range: Range,
-        next: Option<Branch<'a>>
+        mut parent: Branch<'a>
     ) -> Option<Self> {
         if tokens.is_empty() {
             return None;
         }
+        parent.repeated += 1;
         Some(Self {
             index: 0,
             repeated: 0,
             tokens,
             path,
             prev,
-            repeat_min: range.0.saturating_sub(1),
-            repeat_max: range.1.map(|i| i.saturating_sub(1)),
-            next: next.map(Rc::new)
+            parent: Some(Rc::new(parent))
         })
     }
     fn parent_tokens(&self) -> &[(Token, Range)] {
@@ -220,15 +217,16 @@ impl<'a> Branch<'a> {
         }
     }
     fn next_branch(&self) -> Option<Self> {
-        if self.repeat_min > 0 {
-            // Don't add the next branch until we've repeated this one enough
-            return None;
-        }
         if self.index + 1 >= self.tokens().len() {
-            if let Some(ref next) = self.next {
-                // Group is closing, migrate previous & current groups to next.
-                let mut next = (**next).clone();
+            let parent = self.parent.as_ref()?;
+            let (_, Range(min, _)) = *parent.get_token();
+            // Don't add the next branch until we've repeated this one enough
+            if parent.repeated < min {
+                return None;
+            }
 
+            if let Some(mut next) = parent.next_branch() {
+                // Group is closing, migrate previous & current groups to next.
                 for (key, value) in &self.prev {
                     if let Some(slot) = next.prev.iter_mut().find(|(key2, _)| key == key2) {
                         *slot = (key.clone(), value.clone());
@@ -238,7 +236,7 @@ impl<'a> Branch<'a> {
                 }
                 self.push_to_prev(&mut next.prev);
 
-                return Some(next)
+                return Some(next);
             }
             return None;
         }
@@ -249,31 +247,36 @@ impl<'a> Branch<'a> {
         })
     }
     fn add_repeats(&self, branches: &mut Vec<Branch<'a>>, offset: usize) {
-        if self.repeat_max.map(|max| max == 0).unwrap_or(false) {
-            return;
-        }
+        let mut branch = self;
+        loop {
+            if let (Token::Group(ref alternatives), Range(_, max)) = *branch.get_token() {
+                if max.map(|max| branch.repeated < max).unwrap_or(true) {
+                    for alternative in 0..alternatives.len() {
+                        let mut path = branch.path.to_vec();
+                        path.push(Group {
+                            start: offset,
+                            variant: alternative,
+                            index: branch.index,
+                            end: 0
+                        });
 
-        let tokens = self.parent_tokens();
-        let group = self.path.last().expect("add_repeats called on top level");
-        match tokens[group.index] {
-            (Token::Group(ref repeats), _) => {
-                for alternative in 0..repeats.len() {
-                    let mut path = self.path.clone();
-                    let last = path.last_mut().unwrap();
-                    last.start = offset;
-                    last.variant = alternative;
-
-                    branches.push(Self {
-                        index: 0,
-                        path,
-                        repeated: 0,
-                        repeat_min: self.repeat_min.saturating_sub(1),
-                        repeat_max: self.repeat_max.map(|max| max - 1),
-                        ..self.clone()
-                    });
+                        if let Some(group) = Branch::group(
+                            path.into_boxed_slice(),
+                            branch.prev.clone(),
+                            branch.tokens,
+                            branch.clone()
+                        ) {
+                            branches.push(group);
+                        }
+                    }
+                    break;
                 }
-            },
-            _ => panic!("non-group index in path")
+            }
+
+            match branch.parent {
+                Some(ref new) => branch = new,
+                None => break
+            }
         }
     }
     /// Returns if this node is "explored" enough times,
@@ -282,9 +285,16 @@ impl<'a> Branch<'a> {
         let mut branch = Cow::Borrowed(self);
 
         loop {
-            if branch.repeat_min > 0 {
-                // Group did not repeat enough times!
-                return false;
+            {
+                let mut branch = &*branch;
+                while let Some(ref parent) = branch.parent {
+                    let (_, Range(min, _)) = *parent.get_token();
+                    if parent.repeated < min {
+                        // Group did not repeat enough times!
+                        return false;
+                    }
+                    branch = parent;
+                }
             }
 
             let (_, Range(min, _)) = *branch.get_token();
@@ -330,8 +340,7 @@ impl<'a> PosixRegexMatcher<'a> {
                         path.into(),
                         branch.prev.clone(),
                         branch.tokens,
-                        range,
-                        branch.next_branch()
+                        branch.clone()
                     ) {
                         insert.push(branch);
                     }
@@ -347,7 +356,6 @@ impl<'a> PosixRegexMatcher<'a> {
         }
 
         if !insert.is_empty() {
-            // Resolve recursively
             let mut new = self.expand(&mut insert);
             insert.append(&mut new);
         }
@@ -418,9 +426,13 @@ impl<'a> PosixRegexMatcher<'a> {
                     }
                 }
 
-                // Step 2: Check if the token matches
+                // Step 2: Check if the token isn't repeated enough times already
+                accepts = accepts && max.map(|max| branch.repeated < max).unwrap_or(true);
+
+                // Step 3: Check if the token matches
                 accepts = accepts && match *token {
                     Token::InternalStart => next.is_some(),
+                    Token::Group(_) => false, // <- content is already expanded and handled
 
                     Token::Any => next.map(|c| !self.base.newline || c != b'\n').unwrap_or(false),
                     Token::Char(c) => if self.base.case_insensitive {
@@ -428,7 +440,6 @@ impl<'a> PosixRegexMatcher<'a> {
                     } else {
                         next == Some(c)
                     },
-                    Token::Group(_) => false, // <- handled separately
                     Token::OneOf { invert, ref list } => if let Some(next) = next {
                         (!invert || !self.base.newline || next != b'\n')
                         && list.iter().any(|c| c.matches(next, self.base.case_insensitive)) == !invert
@@ -444,7 +455,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     Token::WordStart => true
                 };
 
-                if !accepts || max.map(|max| branch.repeated >= max).unwrap_or(false) {
+                if !accepts {
                     if branch.is_explored() {
                         succeeded = Some(branch.clone());
                     }
@@ -523,6 +534,9 @@ mod tests {
         assert!(matches_exact(r"a\{1,2\}b", "ab").is_some());
         assert!(matches_exact(r"a\{1,2\}b", "aab").is_some());
         assert!(matches_exact(r"a\{1,2\}b", "aaab").is_none());
+
+        assert!(matches_exact(r"[abc]\{3\}", "abcTRAILING").is_some());
+        assert!(matches_exact(r"[abc]\{3\}", "abTRAILING").is_none());
     }
     #[test]
     fn any() {
@@ -598,6 +612,14 @@ mod tests {
             matches("hi", "hello hi lol"),
             vec!(vec![(6, 8)])
         );
+        assert_eq!(
+            matches_exact(r"\(\([[:alpha:]]\)*\)", "abcdefg"),
+            Some(vec![(0, 7), (0, 7), (6, 7)])
+        );
+        assert_eq!(
+            matches_exact(r"\(\.\([[:alpha:]]\)\)*", ".a.b.c.d.e.f.g"),
+            Some(vec![(0, 14), (12, 14), (13, 14)])
+        );
     }
     #[test]
     fn start_and_end() {
@@ -631,6 +653,7 @@ mod tests {
     }
     #[test]
     fn groups() {
+        assert!(matches_exact(r"\(hello\) world", "hello world").is_some());
         assert!(matches_exact(r"\(a*\|b\|c\)d", "d").is_some());
         assert!(matches_exact(r"\(a*\|b\|c\)d", "aaaad").is_some());
         assert!(matches_exact(r"\(a*\|b\|c\)d", "bd").is_some());
@@ -647,10 +670,15 @@ mod tests {
         assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "ad").is_some());
         assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "abd").is_some());
         assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "abcd").is_none());
+        assert!(matches_exact(r"\(\(a\|b\|c\)\)\{1,2\}d", "abd").is_some());
+        assert!(matches_exact(r"\(\(a\|b\|c\)\)\{1,2\}d", "abcd").is_none());
 
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababad").is_none());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababd").is_some());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "abad").is_none());
+
+        assert!(matches_exact(r"\(\([abc]\)\)\{3\}", "abcTRAILING").is_some());
+        assert!(matches_exact(r"\(\([abc]\)\)\{3\}", "abTRAILING").is_none());
     }
     #[test]
     fn case_insensitive() {
@@ -665,10 +693,10 @@ mod tests {
     }
     #[test]
     fn newline() {
-        assert!(compile(r"^hello$")
+        assert_eq!(compile(r"^hello$")
             .newline(true)
             .matches(b"hi\nhello\ngreetings", None)
-            .len() == 1);
+            .len(), 1);
         assert!(compile(r"^hello$")
             .newline(true)
             .matches(b"hi\ngood day\ngreetings", None)
