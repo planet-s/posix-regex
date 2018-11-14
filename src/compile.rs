@@ -46,7 +46,10 @@ pub enum Token {
     Any,
     Char(u8),
     End,
-    Group(Vec<Vec<(Token, Range)>>),
+    Group {
+        id: usize,
+        branches: Vec<Vec<(Token, Range)>>
+    },
     OneOf {
         invert: bool,
         list: Vec<Collation>
@@ -63,7 +66,7 @@ impl fmt::Debug for Token {
             Token::Any => write!(f, "."),
             Token::Char(c) => write!(f, "{:?}", c as char),
             Token::End => write!(f, "$"),
-            Token::Group(ref inner) => write!(f, "Group({:?})", inner),
+            Token::Group { ref branches, .. } => write!(f, "Group({:?})", branches),
             Token::OneOf { invert, ref list } => write!(f, "[invert: {}; {:?}]", invert, list),
             Token::Start => write!(f, "^"),
             Token::WordEnd => write!(f, ">"),
@@ -89,14 +92,16 @@ pub enum Error {
 /// A regex builder struct
 pub struct PosixRegexBuilder<'a> {
     input: &'a [u8],
-    classes: HashMap<&'a [u8], fn(u8) -> bool>
+    classes: HashMap<&'a [u8], fn(u8) -> bool>,
+    group_id: usize
 }
 impl<'a> PosixRegexBuilder<'a> {
     /// Create a new instance that is ready to parse the regex `input`
     pub fn new(input: &'a [u8]) -> Self {
         Self {
             input,
-            classes: HashMap::new()
+            classes: HashMap::new(),
+            group_id: 0
         }
     }
     /// Add a custom collation class, for use within square brackets (such as `[[:digit:]]`)
@@ -125,7 +130,7 @@ impl<'a> PosixRegexBuilder<'a> {
         self
     }
     /// "Compile" this regex to a struct ready to match input
-    pub fn compile(&mut self) -> Result<PosixRegex<'static>, Error> {
+    pub fn compile(mut self) -> Result<PosixRegex<'static>, Error> {
         let search = self.compile_tokens()?;
         Ok(PosixRegex::new(Cow::Owned(search)))
     }
@@ -238,7 +243,14 @@ impl<'a> PosixRegexBuilder<'a> {
                     }
                 },
                 b'\\' => match self.next()? {
-                    b'(' => Token::Group(self.compile_tokens()?),
+                    b'(' => {
+                        let id = self.group_id;
+                        self.group_id += 1;
+                        Token::Group {
+                            id,
+                            branches: self.compile_tokens()?
+                        }
+                    },
                     b')' => {
                         alternatives.push(chain);
                         return Ok(alternatives);
@@ -327,19 +339,19 @@ mod tests {
     }
     #[test]
     fn groups() {
-        assert_eq!(compile(br"\(abc\|bcd\|cde\)"), &[t(Token::Group(vec![
+        assert_eq!(compile(br"\(abc\|bcd\|cde\)"), &[t(Token::Group { id: 0, branches: vec![
             vec![c(b'a'), c(b'b'), c(b'c')],
             vec![c(b'b'), c(b'c'), c(b'd')],
             vec![c(b'c'), c(b'd'), c(b'e')]
-        ]))]);
+        ]})]);
         assert_eq!(compile(br"\(abc\|\(bcd\|cde\)\)"), &[
-            t(Token::Group(vec![
+            t(Token::Group { id: 0, branches: vec![
                 vec![c(b'a'), c(b'b'), c(b'c')],
-                vec![t(Token::Group(vec![
+                vec![t(Token::Group { id: 1, branches: vec![
                     vec![c(b'b'), c(b'c'), c(b'd')],
                     vec![c(b'c'), c(b'd'), c(b'e')]
-                ]))]
-            ]))
+                ]})]
+            ]})
         ]);
     }
     #[test]

@@ -57,9 +57,18 @@ impl<'a> PosixRegex<'a> {
         self.no_end = value;
         self
     }
+    /// Return the total number of matches that **will** be returned by
+    /// `matches_exact` or in each match in `matches`.
+    pub fn count_groups(&self) -> usize {
+        let mut count = 1;
+        for branch in &*self.branches {
+            count += count_groups(branch);
+        }
+        count
+    }
     /// Match the string starting at the current position. This does not find
     /// substrings.
-    pub fn matches_exact(&self, input: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn matches_exact(&self, input: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         let mut groups = Vec::new();
         let mut matcher = PosixRegexMatcher {
             base: self,
@@ -71,16 +80,16 @@ impl<'a> PosixRegex<'a> {
             .filter_map(|tokens| Branch::new(tokens))
             .collect();
 
-        matcher.groups.push((matcher.offset, 0));
+        matcher.groups.push(Some((matcher.offset, 0)));
         if !matcher.matches_exact(branches) {
             return None;
         }
-        groups[0].1 = matcher.offset;
+        groups[0].as_mut().unwrap().1 = matcher.offset;
 
         Some(groups)
     }
     /// Match any substrings in the string, but optionally no more than `max`
-    pub fn matches(&self, input: &[u8], mut max: Option<usize>) -> Vec<Vec<(usize, usize)>> {
+    pub fn matches(&self, input: &[u8], mut max: Option<usize>) -> Vec<Vec<Option<(usize, usize)>>> {
         let mut groups = Vec::new();
         let mut matcher = PosixRegexMatcher {
             base: self,
@@ -91,7 +100,7 @@ impl<'a> PosixRegex<'a> {
 
         let tokens = vec![
             (Token::InternalStart, Range(0, None)),
-            (Token::Group(self.branches.to_vec()), Range(1, Some(1)))
+            (Token::Group { id: 0, branches: self.branches.to_vec() }, Range(1, Some(1)))
         ];
         let branches = vec![
             Branch::new(&tokens).unwrap()
@@ -106,13 +115,24 @@ impl<'a> PosixRegex<'a> {
     }
 }
 
+fn count_groups(tokens: &[(Token, Range)]) -> usize {
+    let mut groups = 0;
+    for (token, _) in tokens {
+        if let Token::Group { ref branches, .. } = token {
+            groups += 1;
+            for branch in branches {
+                groups += count_groups(branch);
+            }
+        }
+    }
+    groups
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Group {
     index: usize,
     variant: usize,
-
-    start: usize,
-    end: usize
+    id: usize
 }
 
 #[derive(Clone)]
@@ -121,7 +141,7 @@ struct Branch<'a> {
     repeated: u32,
     tokens: &'a [(Token, Range)],
     path: Box<[Group]>,
-    prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
+    prev: Box<[Option<(usize, usize)>]>,
 
     parent: Option<Rc<Branch<'a>>>
 }
@@ -143,14 +163,14 @@ impl<'a> Branch<'a> {
             repeated: 0,
             tokens: tokens,
             path: Box::new([]),
-            prev: Vec::new(),
+            prev: vec![None; count_groups(tokens)].into_boxed_slice(),
 
             parent: None
         })
     }
     fn group(
         path: Box<[Group]>,
-        prev: Vec<(Box<[(usize, usize)]>, (usize, usize))>,
+        prev: Box<[Option<(usize, usize)>]>,
         tokens: &'a [(Token, Range)],
         mut parent: Branch<'a>
     ) -> Option<Self> {
@@ -174,7 +194,7 @@ impl<'a> Branch<'a> {
         if len > 0 {
             for group in &self.path[..len-1] {
                 match tokens[group.index] {
-                    (Token::Group(ref inner), _) => tokens = &inner[group.variant],
+                    (Token::Group { ref branches, .. }, _) => tokens = &branches[group.variant],
                     _ => panic!("non-group index in path")
                 }
             }
@@ -187,7 +207,7 @@ impl<'a> Branch<'a> {
 
         if let Some(group) = self.path.last() {
             match tokens[group.index] {
-                (Token::Group(ref inner), _) => tokens = &inner[group.variant],
+                (Token::Group { ref branches, .. }, _) => tokens = &branches[group.variant],
                 _ => panic!("non-group index in path")
             }
         }
@@ -199,20 +219,13 @@ impl<'a> Branch<'a> {
     }
     fn update_group_end(&mut self, offset: usize) {
         for group in &mut *self.path {
-            group.end = offset;
+            self.prev[group.id].as_mut().unwrap().1 = offset;
         }
     }
-    fn push_to_prev(&self, prev: &mut Vec<(Box<[(usize, usize)]>, (usize, usize))>) {
-        for i in 0..self.path.len() {
-            let key: Vec<_> = self.path[..=i].iter().map(|g| (g.index, g.variant)).collect();
-            let key = key.into();
-            let group = &self.path[i];
-            let value = (group.start, group.end);
-
-            if let Some(slot) = prev.iter_mut().find(|(key2, _)| key == *key2) {
-                *slot = (key, value);
-            } else {
-                prev.push((key, value));
+    fn extend(&self, prev: &mut Box<[Option<(usize, usize)>]>) {
+        for (i, &group) in self.prev.iter().enumerate() {
+            if group.is_some() {
+                prev[i] = group;
             }
         }
     }
@@ -227,14 +240,7 @@ impl<'a> Branch<'a> {
 
             if let Some(mut next) = parent.next_branch() {
                 // Group is closing, migrate previous & current groups to next.
-                for (key, value) in &self.prev {
-                    if let Some(slot) = next.prev.iter_mut().find(|(key2, _)| key == key2) {
-                        *slot = (key.clone(), value.clone());
-                    } else {
-                        next.prev.push((key.clone(), value.clone()));
-                    }
-                }
-                self.push_to_prev(&mut next.prev);
+                self.extend(&mut next.prev);
 
                 return Some(next);
             }
@@ -249,20 +255,22 @@ impl<'a> Branch<'a> {
     fn add_repeats(&self, branches: &mut Vec<Branch<'a>>, offset: usize) {
         let mut branch = self;
         loop {
-            if let (Token::Group(ref alternatives), Range(_, max)) = *branch.get_token() {
+            if let (Token::Group { id, branches: ref alternatives }, Range(_, max)) = *branch.get_token() {
                 if max.map(|max| branch.repeated < max).unwrap_or(true) {
                     for alternative in 0..alternatives.len() {
                         let mut path = branch.path.to_vec();
                         path.push(Group {
-                            start: offset,
                             variant: alternative,
                             index: branch.index,
-                            end: 0
+                            id
                         });
+
+                        let mut prev = self.prev.clone();
+                        prev[id].get_or_insert((0, 0)).0 = offset;
 
                         if let Some(group) = Branch::group(
                             path.into_boxed_slice(),
-                            branch.prev.clone(),
+                            prev,
                             branch.tokens,
                             branch.clone()
                         ) {
@@ -314,7 +322,7 @@ struct PosixRegexMatcher<'a> {
     base: &'a PosixRegex<'a>,
     input: &'a [u8],
     offset: usize,
-    groups: &'a mut Vec<(usize, usize)>
+    groups: &'a mut Vec<Option<(usize, usize)>>
 }
 impl<'a> PosixRegexMatcher<'a> {
     fn expand<'b>(&mut self, branches: &mut [Branch<'b>]) -> Vec<Branch<'b>> {
@@ -325,20 +333,22 @@ impl<'a> PosixRegexMatcher<'a> {
 
             let (ref token, range) = *branch.get_token();
 
-            if let Token::Group(ref inner) = token {
+            if let Token::Group { id, branches: ref inner } = *token {
                 for alternation in 0..inner.len() {
                     let mut path = Vec::with_capacity(branch.path.len() + 1);
                     path.extend_from_slice(&branch.path);
                     path.push(Group {
                         index: branch.index,
                         variant: alternation,
-                        start: self.offset,
-                        end: 0
+                        id
                     });
+
+                    let mut prev = branch.prev.clone();
+                    prev[id].get_or_insert((0, 0)).0 = self.offset;
 
                     if let Some(branch) = Branch::group(
                         path.into(),
-                        branch.prev.clone(),
+                        prev,
                         branch.tokens,
                         branch.clone()
                     ) {
@@ -432,7 +442,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 // Step 3: Check if the token matches
                 accepts = accepts && match *token {
                     Token::InternalStart => next.is_some(),
-                    Token::Group(_) => false, // <- content is already expanded and handled
+                    Token::Group { .. } => false, // <- content is already expanded and handled
 
                     Token::Any => next.map(|c| !self.base.newline || c != b'\n').unwrap_or(false),
                     Token::Char(c) => if self.base.case_insensitive {
@@ -472,13 +482,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     // The internal start thing is lazy, not greedy:
                     (succeeded.is_some() && branches.iter().all(|t| t.get_token().0 == Token::InternalStart)) {
                 if let Some(ref branch) = succeeded {
-                    // Push the bounds of all successful groups
-                    let mut prev = branch.prev.clone();
-                    branch.push_to_prev(&mut prev);
-
-                    for &(_, group) in &prev {
-                        self.groups.push(group);
-                    }
+                    self.groups.extend(branch.prev.into_iter());
                 }
                 return succeeded.is_some();
             }
@@ -508,11 +512,11 @@ mod tests {
             .compile()
             .expect("error compiling regex")
     }
-    fn matches(regex: &str, input: &str) -> Vec<Vec<(usize, usize)>> {
+    fn matches(regex: &str, input: &str) -> Vec<Vec<Option<(usize, usize)>>> {
         compile(regex)
             .matches(input.as_bytes(), None)
     }
-    fn matches_exact(regex: &str, input: &str) -> Option<Vec<(usize, usize)>> {
+    fn matches_exact(regex: &str, input: &str) -> Option<Vec<Option<(usize, usize)>>> {
         compile(regex)
             .matches_exact(input.as_bytes())
     }
@@ -570,55 +574,63 @@ mod tests {
     fn offsets() {
         assert_eq!(
             matches_exact("abc", "abcd"),
-            Some(vec![(0, 3)])
+            Some(vec![Some((0, 3))])
         );
         assert_eq!(
             matches_exact(r"[[:alpha:]]\+", "abcde12345"),
-            Some(vec![(0, 5)])
+            Some(vec![Some((0, 5))])
         );
         assert_eq!(
             matches_exact(r"a\(bc\)\+d", "abcbcd"),
-            Some(vec![(0, 6), (3, 5)])
+            Some(vec![Some((0, 6)), Some((3, 5))])
         );
         assert_eq!(
             matches_exact(r"hello\( \(world\|universe\) :D\)\?!", "hello world :D!"),
-            Some(vec![(0, 15), (5, 14), (6, 11)])
+            Some(vec![Some((0, 15)), Some((5, 14)), Some((6, 11))])
         );
         assert_eq!(
             matches_exact(r"hello\( \(world\|universe\) :D\)\?", "hello world :D"),
-            Some(vec![(0, 14), (5, 14), (6, 11)])
+            Some(vec![Some((0, 14)), Some((5, 14)), Some((6, 11))])
         );
         assert_eq!(
             matches_exact(r"\(\<hello\>\) world", "hello world"),
-            Some(vec![(0, 11), (0, 5)])
+            Some(vec![Some((0, 11)), Some((0, 5))])
         );
         assert_eq!(
             matches_exact(r".*d", "hid howd ared youd"),
-            Some(vec![(0, 18)])
+            Some(vec![Some((0, 18))])
         );
         assert_eq!(
             matches_exact(r".*\(a\)", "bbbbba"),
-            Some(vec![(0, 6), (5, 6)])
+            Some(vec![Some((0, 6)), Some((5, 6))])
         );
         assert_eq!(
             matches_exact(r"\(a \(b\) \(c\)\) \(d\)", "a b c d"),
-            Some(vec![(0, 7), (0, 5), (2, 3), (4, 5), (6, 7)])
+            Some(vec![Some((0, 7)), Some((0, 5)), Some((2, 3)), Some((4, 5)), Some((6, 7))])
         );
         assert_eq!(
             matches_exact(r"\(.\)*", "hello"),
-            Some(vec![(0, 5), (4, 5)])
+            Some(vec![Some((0, 5)), Some((4, 5))])
         );
         assert_eq!(
             matches("hi", "hello hi lol"),
-            vec!(vec![(6, 8)])
+            vec!(vec![Some((6, 8))])
         );
         assert_eq!(
             matches_exact(r"\(\([[:alpha:]]\)*\)", "abcdefg"),
-            Some(vec![(0, 7), (0, 7), (6, 7)])
+            Some(vec![Some((0, 7)), Some((0, 7)), Some((6, 7))])
         );
         assert_eq!(
             matches_exact(r"\(\.\([[:alpha:]]\)\)*", ".a.b.c.d.e.f.g"),
-            Some(vec![(0, 14), (12, 14), (13, 14)])
+            Some(vec![Some((0, 14)), Some((12, 14)), Some((13, 14))])
+        );
+        assert_eq!(
+            matches_exact(r"\(a\|\(b\)\)*\(c\)", "bababac"),
+            Some(vec![Some((0, 7)), Some((5, 6)), Some((4, 5)), Some((6, 7))])
+        );
+        assert_eq!(
+            matches_exact(r"\(a\|\(b\)\)*\(c\)", "aaac"),
+            Some(vec![Some((0, 4)), Some((2, 3)), None, Some((3, 4))])
         );
     }
     #[test]
@@ -725,7 +737,7 @@ mod tests {
     #[bench]
     fn speed_matches(b: &mut Bencher) {
         b.iter(|| {
-            assert!(matches(r"\(\(a*\|b\|c\) test\|yee\)", "oooo aaaaa test", None).len() == 1);
+            assert_eq!(matches(r"\(\(a*\|b\|c\) test\|yee\)", "oooo aaaaa test").len(), 1);
         })
     }
 }
