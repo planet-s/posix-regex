@@ -26,6 +26,7 @@ mod std {
 pub mod compile;
 pub mod ctype;
 pub mod matcher;
+pub mod tree;
 
 pub use compile::PosixRegexBuilder;
 pub use matcher::PosixRegex;

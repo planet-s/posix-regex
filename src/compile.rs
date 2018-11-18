@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use {ctype, PosixRegex};
+use tree::*;
 
 /// Repetition bounds, for example + is (1, None), and ? is (0, Some(1))
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,7 @@ impl fmt::Debug for Range {
 }
 
 /// An item inside square brackets, like `[abc]` or `[[:digit:]]`
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Collation {
     Char(u8),
     Class(fn(u8) -> bool)
@@ -31,9 +32,21 @@ impl Collation {
     /// Compare this collation to a character
     pub fn matches(&self, other: u8, insensitive: bool) -> bool {
         match *self {
-            Collation::Char(me) if insensitive => me & !32 == other & !32,
+            Collation::Char(me) if insensitive => if ctype::is_alpha(me) && ctype::is_alpha(other) {
+                me | 32 == other | 32
+            } else {
+                me == other
+            },
             Collation::Char(me) => me == other,
             Collation::Class(f) => f(other)
+        }
+    }
+}
+impl fmt::Debug for Collation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Collation::Char(c) => write!(f, "{:?}", c as char),
+            Collation::Class(c) => write!(f, "{:p}", c),
         }
     }
 }
@@ -41,19 +54,19 @@ impl Collation {
 /// A single "compiled" token, such as a `.` or a character literal
 #[derive(Clone, PartialEq, Eq)]
 pub enum Token {
+    /// Internal token used to find matches that might be anywhere in the text
     InternalStart,
 
+    Alternative,
     Any,
     Char(u8),
     End,
-    Group {
-        id: usize,
-        branches: Vec<Vec<(Token, Range)>>
-    },
+    Group(usize),
     OneOf {
         invert: bool,
         list: Vec<Collation>
     },
+    Root,
     Start,
     WordEnd,
     WordStart
@@ -63,11 +76,13 @@ impl fmt::Debug for Token {
         match *self {
             Token::InternalStart => write!(f, "<START>"),
 
+            Token::Alternative => write!(f, "Alternative"),
             Token::Any => write!(f, "."),
             Token::Char(c) => write!(f, "{:?}", c as char),
             Token::End => write!(f, "$"),
-            Token::Group { ref branches, .. } => write!(f, "Group({:?})", branches),
-            Token::OneOf { invert, ref list } => write!(f, "[invert: {}; {:?}]", invert, list),
+            Token::Group(id) => write!(f, "Group({})", id),
+            Token::OneOf { invert, ref list } => write!(f, "{{invert: {}, {:?}}}", invert, list),
+            Token::Root => write!(f, "Root"),
             Token::Start => write!(f, "^"),
             Token::WordEnd => write!(f, ">"),
             Token::WordStart => write!(f, "<")
@@ -93,7 +108,8 @@ pub enum Error {
 pub struct PosixRegexBuilder<'a> {
     input: &'a [u8],
     classes: HashMap<&'a [u8], fn(u8) -> bool>,
-    group_id: usize
+    group_id: usize,
+    builder: TreeBuilder
 }
 impl<'a> PosixRegexBuilder<'a> {
     /// Create a new instance that is ready to parse the regex `input`
@@ -101,7 +117,8 @@ impl<'a> PosixRegexBuilder<'a> {
         Self {
             input,
             classes: HashMap::new(),
-            group_id: 1
+            group_id: 1,
+            builder: TreeBuilder::default()
         }
     }
     /// Add a custom collation class, for use within square brackets (such as `[[:digit:]]`)
@@ -130,9 +147,17 @@ impl<'a> PosixRegexBuilder<'a> {
         self
     }
     /// "Compile" this regex to a struct ready to match input
-    pub fn compile(mut self) -> Result<PosixRegex<'static>, Error> {
-        let search = self.compile_tokens()?;
-        Ok(PosixRegex::new(Cow::Owned(search)))
+    pub fn compile(self) -> Result<PosixRegex<'static>, Error> {
+        let tree = self.compile_tokens()?;
+        Ok(PosixRegex::new(Cow::Owned(tree)))
+    }
+    pub fn compile_tokens(mut self) -> Result<Tree, Error> {
+        self.builder.start_internal(Token::Root, Range(1, Some(1)));
+        self.parse()?;
+        self.builder.finish_internal();
+        let mut tree = self.builder.finish();
+        tree.mark_end();
+        Ok(tree)
     }
 
     fn consume(&mut self, amount: usize) {
@@ -161,22 +186,53 @@ impl<'a> PosixRegexBuilder<'a> {
         self.consume(1);
         Ok(())
     }
-    pub fn compile_tokens(&mut self) -> Result<Vec<Vec<(Token, Range)>>, Error> {
-        let mut alternatives = Vec::new();
-        let mut chain: Vec<(Token, Range)> = Vec::new();
-
-        while let Some(&c) = self.input.first() {
-            self.consume(1);
+    fn parse_range(&mut self) -> Result<Range, Error> {
+        let mut range = Range(1, Some(1));
+        if let Some(&c) = self.input.first() {
+            let new = match c {
+                b'*' => Some((1, Range(0, None))),
+                b'\\' => match self.input.get(1) {
+                    Some(b'?') => Some((2, Range(0, Some(1)))),
+                    Some(b'+') => Some((2, Range(1, None))),
+                    Some(b'{') => {
+                        self.consume(2);
+                        let first = self.take_int()?.ok_or(Error::EmptyRepetition)?;
+                        let mut second = Some(first);
+                        if let Some(b',') = self.input.first() {
+                            self.consume(1);
+                            second = self.take_int()?;
+                        }
+                        if self.input.first() == Some(&b'}') {
+                            self.consume(1);
+                        } else if self.input.starts_with(br"\}") {
+                            self.consume(2);
+                        } else {
+                            return Err(Error::UnclosedRepetition);
+                        }
+                        if second.map(|second| first > second).unwrap_or(false) {
+                            return Err(Error::IllegalRange);
+                        }
+                        range = Range(first, second);
+                        None
+                    },
+                    _ => None
+                },
+                _ => None
+            };
+            if let Some((consume, new)) = new {
+                range = new;
+                self.consume(consume);
+            }
+        }
+        Ok(range)
+    }
+    fn parse(&mut self) -> Result<(), Error> {
+        self.builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        while let Ok(c) = self.next() {
             let token = match c {
                 b'^' => Token::Start,
                 b'$' => Token::End,
                 b'.' => Token::Any,
-                b'*' => if let Some(last) = chain.last_mut() {
-                    last.1 = Range(0, None);
-                    continue;
-                } else {
-                    return Err(Error::LeadingRepetition);
-                },
                 b'[' => {
                     let mut list = Vec::new();
                     let invert = self.input.first() == Some(&b'^');
@@ -246,54 +302,21 @@ impl<'a> PosixRegexBuilder<'a> {
                     b'(' => {
                         let id = self.group_id;
                         self.group_id += 1;
-                        Token::Group {
-                            id,
-                            branches: self.compile_tokens()?
-                        }
+                        let checkpoint = self.builder.checkpoint();
+                        self.parse()?;
+                        let range = self.parse_range()?;
+                        self.builder.start_internal_at(checkpoint, Token::Group(id), range);
+                        self.builder.finish_internal();
+                        continue;
                     },
-                    b')' => {
-                        alternatives.push(chain);
-                        return Ok(alternatives);
-                    }
+                    b')' => break,
                     b'|' => {
-                        alternatives.push(chain);
-                        chain = Vec::new();
+                        self.builder.finish_internal();
+                        self.builder.start_internal(Token::Alternative, Range(1, Some(1)));
                         continue;
                     },
                     b'<' => Token::WordStart,
                     b'>' => Token::WordEnd,
-                    c@b'?' | c@b'+' => if let Some(last) = chain.last_mut() {
-                        last.1 = match c {
-                            b'?' => Range(0, Some(1)),
-                            b'+' => Range(1, None),
-                            _ => unreachable!(c)
-                        };
-                        continue;
-                    } else {
-                        return Err(Error::LeadingRepetition);
-                    },
-                    b'{' => if let Some(last) = chain.last_mut() {
-                        let first = self.take_int()?.ok_or(Error::EmptyRepetition)?;
-                        let mut second = Some(first);
-                        if let Some(b',') = self.input.first() {
-                            self.consume(1);
-                            second = self.take_int()?;
-                        }
-                        if self.input.first() == Some(&b'}') {
-                            self.consume(1);
-                        } else if self.input.starts_with(br"\}") {
-                            self.consume(2);
-                        } else {
-                            return Err(Error::UnclosedRepetition);
-                        }
-                        if second.map(|second| first > second).unwrap_or(false) {
-                            return Err(Error::IllegalRange);
-                        }
-                        last.1 = Range(first, second);
-                        continue;
-                    } else {
-                        return Err(Error::LeadingRepetition);
-                    },
                     b'a' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_alnum)] },
                     b'd' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_digit)] },
                     b's' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_space)] },
@@ -305,11 +328,11 @@ impl<'a> PosixRegexBuilder<'a> {
                 },
                 c => Token::Char(c)
             };
-            chain.push((token, Range(1, Some(1))));
+            let range = self.parse_range()?;
+            self.builder.leaf(token, range);
         }
-
-        alternatives.push(chain);
-        Ok(alternatives)
+        self.builder.finish_internal();
+        Ok(())
     }
 }
 
@@ -317,161 +340,220 @@ impl<'a> PosixRegexBuilder<'a> {
 mod tests {
     use super::*;
 
-    fn compile(input: &[u8]) -> Vec<(Token, Range)> {
-        PosixRegexBuilder::new(input)
-            .with_default_classes()
-            .compile_tokens()
-            .expect("error compiling regex")
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-    fn t(t: Token) -> (Token, Range) {
-        (t, Range(1, Some(1)))
-    }
-    fn c(c: u8) -> (Token, Range) {
-        t(Token::Char(c))
+    fn compile(input: &[u8]) -> String {
+        format!(
+            "{:?}",
+            PosixRegexBuilder::new(input)
+                .with_default_classes()
+                .compile_tokens()
+                .expect("error compiling regex")
+        )
     }
 
     #[test]
     fn basic() {
-        assert_eq!(compile(b"abc"), &[c(b'a'), c(b'b'), c(b'c')]);
+        assert_eq!(
+            compile(b"abc"),
+            "\
+Root 1..1
+  Alternative 1..1
+    'a' 1..1
+    'b' 1..1
+    'c' 1..1
+"
+        );
     }
     #[test]
     fn groups() {
-        assert_eq!(compile(br"\(abc\|bcd\|cde\)"), &[t(Token::Group { id: 1, branches: vec![
-            vec![c(b'a'), c(b'b'), c(b'c')],
-            vec![c(b'b'), c(b'c'), c(b'd')],
-            vec![c(b'c'), c(b'd'), c(b'e')]
-        ]})]);
-        assert_eq!(compile(br"\(abc\|\(bcd\|cde\)\)"), &[
-            t(Token::Group { id: 1, branches: vec![
-                vec![c(b'a'), c(b'b'), c(b'c')],
-                vec![t(Token::Group { id: 2, branches: vec![
-                    vec![c(b'b'), c(b'c'), c(b'd')],
-                    vec![c(b'c'), c(b'd'), c(b'e')]
-                ]})]
-            ]})
-        ]);
+        assert_eq!(
+            compile(br"\(abc\|bcd\|cde\)"),
+            "\
+Root 1..1
+  Alternative 1..1
+    Group(1) 1..1
+      Alternative 1..1
+        'a' 1..1
+        'b' 1..1
+        'c' 1..1
+      Alternative 1..1
+        'b' 1..1
+        'c' 1..1
+        'd' 1..1
+      Alternative 1..1
+        'c' 1..1
+        'd' 1..1
+        'e' 1..1
+"
+        );
+        assert_eq!(
+            compile(br"\(abc\|\(bcd\|cde\)\)"),
+            "\
+Root 1..1
+  Alternative 1..1
+    Group(1) 1..1
+      Alternative 1..1
+        'a' 1..1
+        'b' 1..1
+        'c' 1..1
+      Alternative 1..1
+        Group(2) 1..1
+          Alternative 1..1
+            'b' 1..1
+            'c' 1..1
+            'd' 1..1
+          Alternative 1..1
+            'c' 1..1
+            'd' 1..1
+            'e' 1..1
+"
+        );
     }
     #[test]
     fn words() {
         assert_eq!(
             compile(br"\<word\>"),
-            &[t(Token::WordStart), c(b'w'), c(b'o'), c(b'r'), c(b'd'), t(Token::WordEnd)]
+            "\
+Root 1..1
+  Alternative 1..1
+    < 1..1
+    'w' 1..1
+    'o' 1..1
+    'r' 1..1
+    'd' 1..1
+    > 1..1
+"
         );
     }
     #[test]
     fn repetitions() {
         assert_eq!(
             compile(br"yeee*"),
-            &[c(b'y'), c(b'e'), c(b'e'), (Token::Char(b'e'), Range(0, None))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 1..1
+    'e' 1..1
+    'e' 0.. ending
+"
         );
         assert_eq!(
             compile(br"yee\?"),
-            &[c(b'y'), c(b'e'), (Token::Char(b'e'), Range(0, Some(1)))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 1..1
+    'e' 0..1 ending
+"
         );
         assert_eq!(
             compile(br"yee\+"),
-            &[c(b'y'), c(b'e'), (Token::Char(b'e'), Range(1, None))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 1..1
+    'e' 1..
+"
         );
         assert_eq!(
             compile(br"ye\{2}"),
-            &[c(b'y'), (Token::Char(b'e'), Range(2, Some(2)))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 2..2
+"
         );
         assert_eq!(
             compile(br"ye\{2,}"),
-            &[c(b'y'), (Token::Char(b'e'), Range(2, None))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 2..
+"
         );
         assert_eq!(
             compile(br"ye\{2,3}"),
-            &[c(b'y'), (Token::Char(b'e'), Range(2, Some(3)))]
+            "\
+Root 1..1
+  Alternative 1..1
+    'y' 1..1
+    'e' 2..3
+"
         );
     }
     #[test]
     fn bracket() {
         assert_eq!(
             compile(b"[abc]"),
-            &[t(Token::OneOf {
-                invert: false,
-                list: vec![
-                    Collation::Char(b'a'),
-                    Collation::Char(b'b'),
-                    Collation::Char(b'c')
-                ]
-            })]
+            "\
+Root 1..1
+  Alternative 1..1
+    {invert: false, ['a', 'b', 'c']} 1..1
+"
         );
         assert_eq!(
             compile(b"[^abc]"),
-            &[t(Token::OneOf {
-                invert: true,
-                list: vec![
-                    Collation::Char(b'a'),
-                    Collation::Char(b'b'),
-                    Collation::Char(b'c')
-                ]
-            })]
+            "\
+Root 1..1
+  Alternative 1..1
+    {invert: true, ['a', 'b', 'c']} 1..1
+"
         );
         assert_eq!(
             compile(b"[]] [^]]"),
-            &[
-                t(Token::OneOf { invert: false, list: vec![ Collation::Char(b']') ] }),
-                c(b' '),
-                t(Token::OneOf { invert: true,  list: vec![ Collation::Char(b']') ] }),
-            ]
+            "\
+Root 1..1
+  Alternative 1..1
+    {invert: false, [']']} 1..1
+    ' ' 1..1
+    {invert: true, [']']} 1..1
+"
         );
         assert_eq!(
             compile(b"[0-3] [a-c] [-1] [1-]"),
-            &[
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Char(b'0'),
-                    Collation::Char(b'1'),
-                    Collation::Char(b'2'),
-                    Collation::Char(b'3')
-                ] }),
-                c(b' '),
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Char(b'a'),
-                    Collation::Char(b'b'),
-                    Collation::Char(b'c')
-                ] }),
-                c(b' '),
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Char(b'-'),
-                    Collation::Char(b'1')
-                ] }),
-                c(b' '),
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Char(b'1'),
-                    Collation::Char(b'-')
-                ] })
-            ]
+            "\
+Root 1..1
+  Alternative 1..1
+    {invert: false, ['0', '1', '2', '3']} 1..1
+    ' ' 1..1
+    {invert: false, ['a', 'b', 'c']} 1..1
+    ' ' 1..1
+    {invert: false, ['-', '1']} 1..1
+    ' ' 1..1
+    {invert: false, ['1', '-']} 1..1
+"
         );
         assert_eq!(
             compile(b"[[.-.]-/]"),
-            &[
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Char(b'-'),
-                    Collation::Char(b'.'),
-                    Collation::Char(b'/')
-                ] })
-            ]
+            "\
+Root 1..1
+  Alternative 1..1
+    {invert: false, ['-', '.', '/']} 1..1
+"
         );
         assert_eq!(
             compile(b"[[:digit:][:upper:]]"),
-            &[
-                t(Token::OneOf { invert: false, list: vec![
-                    Collation::Class(ctype::is_digit),
-                    Collation::Class(ctype::is_upper)
-                ] })
-            ]
+            format!("\
+Root 1..1
+  Alternative 1..1
+    {{invert: false, [{:p}, {:p}]}} 1..1
+", ctype::is_digit as fn(u8) -> bool, ctype::is_upper as fn(u8) -> bool)
         );
     }
     #[test]
     fn newline() {
         assert_eq!(
             compile(br"\r\n"),
-            &[c(b'\r'), c(b'\n')]
+            "\
+Root 1..1
+  Alternative 1..1
+    '\\r' 1..1
+    '\\n' 1..1
+"
         );
     }
 }
