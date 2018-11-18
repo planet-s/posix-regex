@@ -6,6 +6,7 @@ use std::prelude::*;
 use compile::{Token, Range};
 use ctype;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use tree::{*, Node as TreeNode};
@@ -156,9 +157,14 @@ impl<'a> PosixRegex<'a> {
         let tree = vec![Node::new(&tree, tree.root, groups)];
 
         let mut matches = Vec::new();
-        while max.map(|max| max > 0).unwrap_or(true) {
+        while max.map(|max| max > 0).unwrap_or(true) && matcher.offset <= matcher.input.len() {
             match matcher.matches_exact(tree.clone()) {
-                Some(groups) => matches.push(groups),
+                Some(groups) => {
+                    if groups[0].unwrap().0 == groups[0].unwrap().1 {
+                        matcher.offset += 1;
+                    }
+                    matches.push(groups)
+                },
                 None => break
             }
             max = max.map(|max| max - 1);
@@ -328,11 +334,15 @@ struct PosixRegexMatcher<'a> {
     offset: usize
 }
 impl<'a> PosixRegexMatcher<'a> {
-    fn expand<'b>(&mut self, branches: &mut [Node<'b>]) -> Vec<Node<'b>> {
+    fn expand<'b>(&mut self, skip: &mut HashSet<NodeId>, branches: &mut [Node<'b>]) -> Vec<Node<'b>> {
         let mut insert = Vec::new();
 
-        for branch in branches {
+        for branch in &mut *branches {
             branch.update_group_end(self.offset);
+
+            if skip.contains(&branch.node) {
+                continue;
+            }
 
             let node = branch.node();
 
@@ -348,7 +358,10 @@ impl<'a> PosixRegexMatcher<'a> {
         }
 
         if !insert.is_empty() {
-            let mut new = self.expand(&mut insert);
+            for branch in &mut *branches {
+                skip.insert(branch.node);
+            }
+            let mut new = self.expand(skip, &mut insert);
             insert.append(&mut new);
         }
         insert
@@ -363,7 +376,7 @@ impl<'a> PosixRegexMatcher<'a> {
         loop {
             let next = self.input.get(self.offset).cloned();
 
-            let mut insert = self.expand(&mut branches);
+            let mut insert = self.expand(&mut HashSet::new(), &mut branches);
             branches.append(&mut insert);
 
             // Handle zero-width stuff
@@ -414,7 +427,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 if insert.is_empty() {
                     break;
                 }
-                let mut insert2 = self.expand(&mut insert);
+                let mut insert2 = self.expand(&mut HashSet::new(), &mut insert);
                 branches.append(&mut insert);
                 branches.append(&mut insert2);
             }
@@ -465,9 +478,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     if branch.is_finished() {
                         let mut add = true;
                         if let Some((new_start, new_end)) = branch.prev[0] {
-                            if new_start == new_end {
-                                add = false;
-                            } else if let Some(previous) = succeeded.as_ref() {
+                            if let Some(previous) = succeeded.as_ref() {
                                 if let Some((prev_start, prev_end)) = previous.prev[0] {
                                     if new_end - new_start <= prev_end - prev_start {
                                         add = false;
@@ -656,8 +667,12 @@ mod tests {
             vec![abox![Some((6, 10)), Some((8, 10))]]
         );
         assert_eq!(
-            matches(r"o*", "helloooooooo woooorld, hooow are you?"),
+            matches(r"o\+", "helloooooooo woooorld, hooow are you?"),
             vec![abox![Some((4, 12))], abox![Some((14, 18))], abox![Some((24, 27))], abox![Some((34, 35))]]
+        );
+        assert_eq!(
+            matches(r"z*", "abc"),
+            vec![abox![Some((0, 0))], abox![Some((1, 1))], abox![Some((2, 2))], abox![Some((3, 3))]]
         );
     }
     #[test]
@@ -692,6 +707,7 @@ mod tests {
     }
     #[test]
     fn groups() {
+        assert!(matches_exact(r"\(a*\)*", "aaaaa").is_some());
         assert!(matches_exact(r"\(hello\) world", "hello world").is_some());
         assert!(matches_exact(r"\(a*\|b\|c\)d", "d").is_some());
         assert!(matches_exact(r"\(a*\|b\|c\)d", "aaaad").is_some());

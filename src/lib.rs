@@ -14,6 +14,7 @@ mod std {
 
     pub mod collections {
         pub use alloc::collections::BTreeMap as HashMap;
+        pub use alloc::collections::BTreeSet as HashSet;
     }
     pub mod prelude {
         pub use alloc::borrow::ToOwned;
