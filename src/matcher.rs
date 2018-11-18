@@ -463,7 +463,21 @@ impl<'a> PosixRegexMatcher<'a> {
                     branch.repeated += 1
                 } else {
                     if branch.is_finished() {
-                        succeeded = Some(branch.clone());
+                        let mut add = true;
+                        if let Some((new_start, new_end)) = branch.prev[0] {
+                            if new_start == new_end {
+                                add = false;
+                            } else if let Some(previous) = succeeded.as_ref() {
+                                if let Some((prev_start, prev_end)) = previous.prev[0] {
+                                    if new_end - new_start <= prev_end - prev_start {
+                                        add = false;
+                                    }
+                                }
+                            }
+                        }
+                        if add {
+                            succeeded = Some(branch.clone());
+                        }
                     }
                     remove += 1;
                 }
@@ -635,13 +649,17 @@ mod tests {
             Some(abox![Some((0, 4)), Some((2, 3)), None, Some((3, 4))])
         );
     }
-    //FIXME #[test]
-    //FIXME fn matches_is_lazy() {
-    //FIXME     assert_eq!(
-    //FIXME         matches(r"\(hi\)\+", "hello hihi kek"),
-    //FIXME         vec![abox![Some((6, 10)), Some((6, 10))]]
-    //FIXME     );
-    //FIXME }
+    #[test]
+    fn matches_is_lazy() {
+        assert_eq!(
+            matches(r"\(hi\)\+", "hello hihi kek"),
+            vec![abox![Some((6, 10)), Some((8, 10))]]
+        );
+        assert_eq!(
+            matches(r"o*", "helloooooooo woooorld, hooow are you?"),
+            vec![abox![Some((4, 12))], abox![Some((14, 18))], abox![Some((24, 27))], abox![Some((34, 35))]]
+        );
+    }
     #[test]
     fn start_and_end() {
         assert!(matches_exact("^abc$", "abc").is_some());
