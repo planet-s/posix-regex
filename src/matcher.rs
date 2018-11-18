@@ -262,6 +262,18 @@ impl<'a> Node<'a> {
             };
             let Range(min, _) = parent.node().range;
 
+            // Get list of ids
+            let mut ids = Vec::new();
+            {
+                let mut parent = Some(parent);
+                while let Some(node) = parent {
+                    if let Token::Group(id) = node.node().token {
+                        ids.push(id);
+                    }
+                    parent = node.parent.as_ref();
+                }
+            }
+
             if parent.repeated >= min {
                 // Group is closing, migrate previous & current groups to next.
                 let mut parent = Some(parent);
@@ -270,8 +282,10 @@ impl<'a> Node<'a> {
                 }
                 if let Some((node, next)) = parent.and_then(|parent| parent.node().next_sibling.map(|node| (parent, node))) {
                     let clone = (**node).clone();
-                    let mut prev = clone.prev;
-                    self.extend(&mut prev);
+                    let mut prev = self.prev.clone();
+                    for &id in &ids {
+                        prev[id] = Some((prev[id].unwrap().0, offset));
+                    }
                     branches.push(Self {
                         node: next,
                         repeated: 0,
@@ -288,7 +302,10 @@ impl<'a> Node<'a> {
                 let Range(_, max) = node.node().range;
                 if max.map(|max| node.repeated < max).unwrap_or(true) {
                     let mut clone = (**node).clone();
-                    self.extend(&mut clone.prev);
+                    clone.prev.copy_from_slice(&self.prev);
+                    for &id in &ids {
+                        clone.prev[id] = Some((clone.prev[id].unwrap().0, offset));
+                    }
                     clone.into_children(branches, offset);
                 }
             }
@@ -338,8 +355,6 @@ impl<'a> PosixRegexMatcher<'a> {
         let mut insert = Vec::new();
 
         for branch in &mut *branches {
-            branch.update_group_end(self.offset);
-
             if skip.contains(&branch.node) {
                 continue;
             }
@@ -383,7 +398,6 @@ impl<'a> PosixRegexMatcher<'a> {
             loop {
                 let mut index = 0;
                 let mut remove = 0;
-                let mut insert = Vec::new();
 
                 while index < branches.len() {
                     if remove > 0 {
@@ -476,6 +490,7 @@ impl<'a> PosixRegexMatcher<'a> {
                     branch.repeated += 1
                 } else {
                     if branch.is_finished() {
+                        branch.update_group_end(self.offset);
                         let mut add = true;
                         if let Some((new_start, new_end)) = branch.prev[0] {
                             if let Some(previous) = succeeded.as_ref() {
@@ -727,6 +742,9 @@ mod tests {
         assert!(matches_exact(r"\(a\|b\|c\)\{1,2\}d", "abcd").is_none());
         assert!(matches_exact(r"\(\(a\|b\|c\)\)\{1,2\}d", "abd").is_some());
         assert!(matches_exact(r"\(\(a\|b\|c\)\)\{1,2\}d", "abcd").is_none());
+        assert!(matches_exact(r"\(\(a\|b\|c\)\{1,2\}\)\{1,2\}d", "abad").is_some());
+        assert!(matches_exact(r"\(\(a\|b\|c\)\{1,2\}\)\{1,2\}d", "ababd").is_some());
+        assert!(matches_exact(r"\(\(a\|b\|c\)\{1,2\}\)\{1,2\}d", "ababad").is_none());
 
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababad").is_none());
         assert!(matches_exact(r"\(a\|b\|c\)\{4\}d", "ababd").is_some());
