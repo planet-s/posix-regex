@@ -6,7 +6,7 @@ use std::ops::{Index, IndexMut};
 
 use compile::{Token, Range};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(usize);
 impl From<usize> for NodeId {
     fn from(id: usize) -> Self {

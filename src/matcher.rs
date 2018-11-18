@@ -241,13 +241,6 @@ impl<'a> Node<'a> {
             }
         }
     }
-    fn extend(&self, prev: &mut Box<[Option<(usize, usize)>]>) {
-        for (i, &group) in self.prev.iter().enumerate() {
-            if group.is_some() {
-                prev[i] = group;
-            }
-        }
-    }
     fn add_branches(&self, branches: &mut Vec<Node<'a>>, offset: usize) {
         if let Some(next) = self.node().next_sibling {
             branches.push(Self {
