@@ -59,6 +59,7 @@ pub enum Token {
 
     Alternative,
     Any,
+    BackRef(u32),
     Char(u8),
     End,
     Group(usize),
@@ -78,6 +79,7 @@ impl fmt::Debug for Token {
 
             Token::Alternative => write!(f, "Alternative"),
             Token::Any => write!(f, "."),
+            Token::BackRef(id) => write!(f, "\\{}", id),
             Token::Char(c) => write!(f, "{:?}", c as char),
             Token::End => write!(f, "$"),
             Token::Group(id) => write!(f, "Group({})", id),
@@ -97,6 +99,7 @@ pub enum Error {
     Expected(u8, Option<u8>),
     IllegalRange,
     IntegerOverflow,
+    InvalidBackRef(u32),
     LeadingRepetition,
     UnclosedRepetition,
     UnexpectedToken(u8),
@@ -298,6 +301,13 @@ impl<'a> PosixRegexBuilder<'a> {
                         list
                     }
                 },
+                b'\\' if self.input.first().map(|&c| (c as char).is_digit(10)).unwrap_or(false) => {
+                    let id = self.take_int()?.unwrap();
+                    if (id as usize) >= self.group_id {
+                        return Err(Error::InvalidBackRef(id));
+                    }
+                    Token::BackRef(id)
+                }
                 b'\\' => match self.next()? {
                     b'(' => {
                         let id = self.group_id;
@@ -555,5 +565,19 @@ Root 1..1
     '\\n' 1..1
 "
         );
+    }
+    #[test]
+    fn backref() {
+        assert_eq!(
+            compile(br"\([abc]\)\1"),
+            "\
+Root 1..1
+  Alternative 1..1
+    Group(1) 1..1
+      Alternative 1..1
+        {invert: false, ['a', 'b', 'c']} 1..1
+    \\1 1..1
+"
+        )
     }
 }

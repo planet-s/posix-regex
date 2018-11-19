@@ -186,6 +186,12 @@ struct GroupEvent {
     id: usize,
     offset: usize
 }
+#[derive(Clone, Copy)]
+struct BackRef {
+    offset: usize,
+    index: usize,
+    len: usize
+}
 
 #[derive(Clone)]
 struct Node<'a> {
@@ -193,7 +199,8 @@ struct Node<'a> {
     parent: Option<Rc<Node<'a>>>,
     node: NodeId,
     prev: ImmutVec<'a, GroupEvent>,
-    repeated: u32
+    repeated: u32,
+    backref: Option<BackRef>
 }
 impl<'a> fmt::Debug for Node<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -204,15 +211,44 @@ impl<'a> fmt::Debug for Node<'a> {
     }
 }
 impl<'a> Node<'a> {
+    /// Prepare a new node, such as linking back references
+    fn prepare(mut me: Self) -> Self {
+        me.repeated = 0;
+        me.backref = None;
+        if let Token::BackRef(id) = me.node().token {
+            let mut start = None;
+            let mut end = None;
+            for event in me.prev.iter_rev() {
+                if event.id != id as usize {
+                    continue;
+                }
+                if event.open {
+                    start = Some(event.offset);
+                    break;
+                } else {
+                    end = end.or(Some(event.offset));
+                }
+            }
+            if let (Some(start), Some(end)) = (start, end) {
+                me.backref = Some(BackRef {
+                    offset: start,
+                    index: 0,
+                    len: end - start
+                });
+            }
+        }
+        me
+    }
     /// Create a new node. This is only called from the main function to start each alternative path
     fn new(tree: &'a Tree, node: NodeId, prev: ImmutVec<'a, GroupEvent>) -> Self {
-        Self {
+        Self::prepare(Self {
             tree: tree,
             parent: None,
             node,
             prev,
-            repeated: 0
-        }
+            repeated: 0,
+            backref: None
+        })
     }
     /// Expand this group node into its children
     fn into_children(mut self, branches: &mut Vec<Node<'a>>, offset: usize) {
@@ -224,7 +260,7 @@ impl<'a> Node<'a> {
         let parent = Rc::new(self);
         for alternative in parent.tree[parent.node].children(&parent.tree) {
             if let Some(node) = parent.tree[alternative].child {
-                branches.push(Self {
+                branches.push(Self::prepare(Self {
                     tree: parent.tree,
                     parent: Some(Rc::clone(&parent)),
                     node,
@@ -233,8 +269,9 @@ impl<'a> Node<'a> {
                         id,
                         offset,
                     }),
-                    repeated: 0
-                });
+                    repeated: 0,
+                    backref: None
+                }));
             }
         }
     }
@@ -276,15 +313,29 @@ impl<'a> Node<'a> {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
+    /// Increment this branch, such as moving a back reference or increasing the number of times repeated
+    fn increment(&mut self) {
+        if let Some(ref mut backref) = self.backref {
+            backref.index += 1;
+            if backref.index >= backref.len {
+                backref.index = 0;
+                self.repeated += 1;
+            }
+        } else {
+            self.repeated += 1;
+        }
+    }
     /// Add all possible branches from this node, such as the next node or
     /// possibly repeat the parent
     fn add_branches(&self, branches: &mut Vec<Node<'a>>, offset: usize) {
-        if let Some(next) = self.node().next_sibling {
-            branches.push(Self {
+        let Range(min, _) = self.node().range;
+        if self.backref.map(|backref| backref.index > 0 || self.repeated < min).unwrap_or(false) {
+            // Wait for back reference to complete
+        } else if let Some(next) = self.node().next_sibling {
+            branches.push(Self::prepare(Self {
                 node: next,
-                repeated: 0,
                 ..self.clone()
-            });
+            }));
         } else {
             let parent = match self.parent {
                 Some(ref parent) => parent,
@@ -320,12 +371,11 @@ impl<'a> Node<'a> {
                             offset
                         });
                     }
-                    branches.push(Self {
+                    branches.push(Self::prepare(Self {
                         node: next,
-                        repeated: 0,
                         prev,
                         ..clone
-                    });
+                    }));
                 }
             }
 
@@ -437,6 +487,9 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut insert = self.expand(&mut set, &mut branches);
             branches.append(&mut insert);
 
+            println!("{:?}", next.map(|c| c as char));
+            println!("before zero {:?}", branches);
+
             // Handle zero-width stuff
             loop {
                 let mut index = 0;
@@ -468,7 +521,7 @@ impl<'a> PosixRegexMatcher<'a> {
                                 _ => unreachable!()
                             };
                             if accepts {
-                                branch.repeated += 1;
+                                branch.increment();
                                 branch.add_branches(&mut insert, self.offset);
                             }
                             if branch.is_finished() {
@@ -490,6 +543,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 branches.append(&mut insert2);
             }
 
+            println!("before main {:?}", branches);
             let mut index = 0;
             let mut remove = 0;
 
@@ -512,6 +566,11 @@ impl<'a> PosixRegexMatcher<'a> {
                     Token::Group { .. } => false, // <- content is already expanded and handled
 
                     Token::Any => next.map(|c| !self.base.newline || c != b'\n').unwrap_or(false),
+                    Token::BackRef(_) => {
+                        let backref = branch.backref.as_ref().unwrap();
+                        println!("comparing with {:?}", self.input[backref.offset + backref.index] as char);
+                        next == Some(self.input[backref.offset + backref.index])
+                    },
                     Token::Char(c) => if self.base.case_insensitive {
                         next.map(|c2| c & !32 == c2 & !32).unwrap_or(false)
                     } else {
@@ -531,7 +590,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 };
 
                 if accepts {
-                    branch.repeated += 1
+                    branch.increment();
                 } else {
                     if branch.is_finished() {
                         let groups = branch.get_capturing_groups(self.max_groups, self.offset);
@@ -555,6 +614,7 @@ impl<'a> PosixRegexMatcher<'a> {
             }
             let end = branches.len() - remove;
             branches.truncate(end);
+            println!("after main {:?}", branches);
 
             if branches.is_empty() ||
                     // The internal start thing is lazy, not greedy:
@@ -797,6 +857,21 @@ mod tests {
 
         assert!(matches_exact(r"\(\([abc]\)\)\{3\}", "abcTRAILING").is_some());
         assert!(matches_exact(r"\(\([abc]\)\)\{3\}", "abTRAILING").is_none());
+    }
+    #[test]
+    fn backref() {
+        assert!(matches_exact(r"\([abc]\)\1d", "aad").is_some());
+        assert!(matches_exact(r"\([abc]\)\1d", "abd").is_none());
+        assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "abcabcd").is_some());
+        assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "abcbcd").is_none());
+        assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "ababd").is_some());
+        assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "abacd").is_none());
+        assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellohd").is_some());
+        assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellod").is_none());
+
+        assert!(matches_exact(r"\(h.\)\1\+!", "hihihi!").is_some());
+        assert!(matches_exact(r"\(h.\)\1\+!", "hehehe!").is_some());
+        assert!(matches_exact(r"\(h.\)\1\+!", "hahehe!").is_none());
     }
     #[test]
     fn case_insensitive() {
