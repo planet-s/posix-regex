@@ -487,9 +487,6 @@ impl<'a> PosixRegexMatcher<'a> {
             let mut insert = self.expand(&mut set, &mut branches);
             branches.append(&mut insert);
 
-            println!("{:?}", next.map(|c| c as char));
-            println!("before zero {:?}", branches);
-
             // Handle zero-width stuff
             loop {
                 let mut index = 0;
@@ -543,7 +540,6 @@ impl<'a> PosixRegexMatcher<'a> {
                 branches.append(&mut insert2);
             }
 
-            println!("before main {:?}", branches);
             let mut index = 0;
             let mut remove = 0;
 
@@ -566,11 +562,9 @@ impl<'a> PosixRegexMatcher<'a> {
                     Token::Group { .. } => false, // <- content is already expanded and handled
 
                     Token::Any => next.map(|c| !self.base.newline || c != b'\n').unwrap_or(false),
-                    Token::BackRef(_) => {
-                        let backref = branch.backref.as_ref().unwrap();
-                        println!("comparing with {:?}", self.input[backref.offset + backref.index] as char);
+                    Token::BackRef(_) => if let Some(ref backref) = branch.backref {
                         next == Some(self.input[backref.offset + backref.index])
-                    },
+                    } else { false },
                     Token::Char(c) => if self.base.case_insensitive {
                         next.map(|c2| c & !32 == c2 & !32).unwrap_or(false)
                     } else {
@@ -614,7 +608,6 @@ impl<'a> PosixRegexMatcher<'a> {
             }
             let end = branches.len() - remove;
             branches.truncate(end);
-            println!("after main {:?}", branches);
 
             if branches.is_empty() ||
                     // The internal start thing is lazy, not greedy:
@@ -869,9 +862,26 @@ mod tests {
         assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellohd").is_some());
         assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellod").is_none());
 
+        // Just make sure this doesn't crash it (even though it should error
+        // but I'm too lazy)
+        assert!(matches_exact(r"\(\1\)", "a").is_none());
+
         assert!(matches_exact(r"\(h.\)\1\+!", "hihihi!").is_some());
         assert!(matches_exact(r"\(h.\)\1\+!", "hehehe!").is_some());
         assert!(matches_exact(r"\(h.\)\1\+!", "hahehe!").is_none());
+
+        assert!(matches_exact(
+            r"\(hello \(\<.*\>\) \)*how are you \2",
+            "hello world how are you world"
+        ).is_some());
+        assert!(matches_exact(
+            r"\(hello \(\<.*\>\) \)*how are you \2",
+            "hello universe hello world how are you world"
+        ).is_some());
+        assert!(matches_exact(
+            r"\(hello \(\<.*\>\) \)*how are you \2",
+            "hello world hello universe how are you world"
+        ).is_none());
     }
     #[test]
     fn case_insensitive() {
