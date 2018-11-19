@@ -3,12 +3,15 @@
 #[cfg(feature = "no_std")]
 use std::prelude::*;
 
-use compile::{Token, Range};
-use ctype;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
+use std::cell::RefCell;
 use std::rc::Rc;
+
+use compile::{Token, Range};
+use ctype;
+use immut_vec::ImmutVec;
 use tree::{*, Node as TreeNode};
 
 /// A regex matcher, ready to match stuff
@@ -90,11 +93,13 @@ impl<'a> PosixRegex<'a> {
         let mut matcher = PosixRegexMatcher {
             base: self,
             input,
-            offset: 0
+            offset: 0,
+            max_groups: self.count_groups()
         };
-        let groups = self.count_groups();
+        let internal_prev = RefCell::new(Vec::new());
+        let prev = ImmutVec::new(&internal_prev);
         let tree = self.tree[self.tree.root].children(&self.tree)
-            .filter_map(|node| self.tree[node].child.map(|child| Node::new(&self.tree, child, groups)))
+            .filter_map(|node| self.tree[node].child.map(|child| Node::new(&self.tree, child, prev)))
             .collect();
 
         let start = matcher.offset;
@@ -112,7 +117,8 @@ impl<'a> PosixRegex<'a> {
         let mut matcher = PosixRegexMatcher {
             base: self,
             input,
-            offset: 0
+            offset: 0,
+            max_groups: self.count_groups()
         };
 
         let mut arena = self.tree.arena.to_vec();
@@ -149,12 +155,13 @@ impl<'a> PosixRegex<'a> {
             child: None
         });
 
-        let groups = self.count_groups();
         let tree = Tree {
             arena: arena.into_boxed_slice(),
             root: start_id
         };
-        let tree = vec![Node::new(&tree, tree.root, groups)];
+        let internal_prev = RefCell::new(Vec::new());
+        let prev = ImmutVec::new(&internal_prev);
+        let tree = vec![Node::new(&tree, tree.root, prev)];
 
         let mut matches = Vec::new();
         while max.map(|max| max > 0).unwrap_or(true) && matcher.offset <= matcher.input.len() {
@@ -173,11 +180,11 @@ impl<'a> PosixRegex<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Group {
-    index: usize,
-    variant: usize,
-    id: usize
+#[derive(Clone, Copy, Debug)]
+struct GroupEvent {
+    open: bool,
+    id: usize,
+    offset: usize
 }
 
 #[derive(Clone)]
@@ -185,7 +192,7 @@ struct Node<'a> {
     tree: &'a Tree,
     parent: Option<Rc<Node<'a>>>,
     node: NodeId,
-    prev: Box<[Option<(usize, usize)>]>,
+    prev: ImmutVec<'a, GroupEvent>,
     repeated: u32
 }
 impl<'a> fmt::Debug for Node<'a> {
@@ -197,15 +204,17 @@ impl<'a> fmt::Debug for Node<'a> {
     }
 }
 impl<'a> Node<'a> {
-    fn new(tree: &'a Tree, node: NodeId, groups: usize) -> Self {
+    /// Create a new node. This is only called from the main function to start each alternative path
+    fn new(tree: &'a Tree, node: NodeId, prev: ImmutVec<'a, GroupEvent>) -> Self {
         Self {
             tree: tree,
             parent: None,
             node,
-            prev: vec![None; groups].into_boxed_slice(),
+            prev,
             repeated: 0
         }
     }
+    /// Expand this group node into its children
     fn into_children(mut self, branches: &mut Vec<Node<'a>>, offset: usize) {
         let id = match self.tree[self.node].token {
             Token::Group(id) => id,
@@ -215,32 +224,60 @@ impl<'a> Node<'a> {
         let parent = Rc::new(self);
         for alternative in parent.tree[parent.node].children(&parent.tree) {
             if let Some(node) = parent.tree[alternative].child {
-                let mut prev = parent.prev.clone();
-                prev[id] = Some((offset, 0));
                 branches.push(Self {
                     tree: parent.tree,
                     parent: Some(Rc::clone(&parent)),
                     node,
-                    prev,
+                    prev: parent.prev.push(GroupEvent {
+                        open: true,
+                        id,
+                        offset,
+                    }),
                     repeated: 0
                 });
             }
         }
     }
+    /// Get the internal token node without additional state metadata
     fn node(&self) -> &TreeNode {
         &self.tree[self.node]
     }
-    fn update_group_end(&mut self, offset: usize) {
+    /// Get a list of all capturing groups
+    fn get_capturing_groups(&self, max_count: usize, offset: usize) -> Box<[Option<(usize, usize)>]> {
+        let mut prev = self.prev;
+
+        // Close all currently open groups
         let mut parent = self.node().parent;
         while let Some(group) = parent {
             let group = &self.tree[group];
             parent = group.parent;
             match group.token {
-                Token::Group(id) => self.prev[id].as_mut().unwrap().1 = offset,
+                Token::Group(id) => prev = prev.push(GroupEvent {
+                    open: false,
+                    id,
+                    offset
+                }),
                 _ => ()
             }
         }
+
+        // Go backwards through the immutable list and add groups
+        let mut groups: Vec<(Option<usize>, Option<usize>)> = vec![(None, None); max_count];
+        for event in prev.iter_rev() {
+            let group = &mut groups[event.id];
+            if event.open {
+                group.0 = group.0.or(Some(event.offset));
+            } else {
+                group.1 = group.1.or(Some(event.offset));
+            }
+        }
+        groups.into_iter()
+            .map(|(start, end)| Some((start?, end?)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
+    /// Add all possible branches from this node, such as the next node or
+    /// possibly repeat the parent
     fn add_branches(&self, branches: &mut Vec<Node<'a>>, offset: usize) {
         if let Some(next) = self.node().next_sibling {
             branches.push(Self {
@@ -275,9 +312,13 @@ impl<'a> Node<'a> {
                 }
                 if let Some((node, next)) = parent.and_then(|parent| parent.node().next_sibling.map(|node| (parent, node))) {
                     let clone = (**node).clone();
-                    let mut prev = self.prev.clone();
+                    let mut prev = self.prev;
                     for &id in &ids {
-                        prev[id] = Some((prev[id].unwrap().0, offset));
+                        prev = prev.push(GroupEvent {
+                            open: false,
+                            id,
+                            offset
+                        });
                     }
                     branches.push(Self {
                         node: next,
@@ -295,10 +336,15 @@ impl<'a> Node<'a> {
                 let Range(_, max) = node.node().range;
                 if max.map(|max| node.repeated < max).unwrap_or(true) {
                     let mut clone = (**node).clone();
-                    clone.prev.copy_from_slice(&self.prev);
+                    let mut prev = self.prev;
                     for &id in &ids {
-                        clone.prev[id] = Some((clone.prev[id].unwrap().0, offset));
+                        prev = prev.push(GroupEvent {
+                            open: false,
+                            id,
+                            offset
+                        });
                     }
+                    clone.prev = prev;
                     clone.into_children(branches, offset);
                 }
             }
@@ -341,7 +387,8 @@ impl<'a> Node<'a> {
 struct PosixRegexMatcher<'a> {
     base: &'a PosixRegex<'a>,
     input: &'a [u8],
-    offset: usize
+    offset: usize,
+    max_groups: usize
 }
 impl<'a> PosixRegexMatcher<'a> {
     fn expand<'b>(&mut self, skip: &mut HashSet<NodeId>, branches: &mut [Node<'b>]) -> Vec<Node<'b>> {
@@ -381,10 +428,13 @@ impl<'a> PosixRegexMatcher<'a> {
         let mut succeeded = None;
         let mut prev = self.offset.checked_sub(1).and_then(|index| self.input.get(index).cloned());
 
+        let mut set = HashSet::new();
+
         loop {
             let next = self.input.get(self.offset).cloned();
 
-            let mut insert = self.expand(&mut HashSet::new(), &mut branches);
+            set.clear();
+            let mut insert = self.expand(&mut set, &mut branches);
             branches.append(&mut insert);
 
             // Handle zero-width stuff
@@ -422,7 +472,7 @@ impl<'a> PosixRegexMatcher<'a> {
                                 branch.add_branches(&mut insert, self.offset);
                             }
                             if branch.is_finished() {
-                                succeeded = Some(branch.clone());
+                                succeeded = Some(branch.get_capturing_groups(self.max_groups, self.offset));
                             }
                             remove += 1;
                         },
@@ -434,7 +484,8 @@ impl<'a> PosixRegexMatcher<'a> {
                 if insert.is_empty() {
                     break;
                 }
-                let mut insert2 = self.expand(&mut HashSet::new(), &mut insert);
+                set.clear();
+                let mut insert2 = self.expand(&mut set, &mut insert);
                 branches.append(&mut insert);
                 branches.append(&mut insert2);
             }
@@ -483,11 +534,12 @@ impl<'a> PosixRegexMatcher<'a> {
                     branch.repeated += 1
                 } else {
                     if branch.is_finished() {
-                        branch.update_group_end(self.offset);
+                        let groups = branch.get_capturing_groups(self.max_groups, self.offset);
+
                         let mut add = true;
-                        if let Some((new_start, new_end)) = branch.prev[0] {
+                        if let Some((new_start, new_end)) = groups[0] {
                             if let Some(previous) = succeeded.as_ref() {
-                                if let Some((prev_start, prev_end)) = previous.prev[0] {
+                                if let Some((prev_start, prev_end)) = previous[0] {
                                     if new_end - new_start <= prev_end - prev_start {
                                         add = false;
                                     }
@@ -495,7 +547,7 @@ impl<'a> PosixRegexMatcher<'a> {
                             }
                         }
                         if add {
-                            succeeded = Some(branch.clone());
+                            succeeded = Some(groups);
                         }
                     }
                     remove += 1;
@@ -507,7 +559,7 @@ impl<'a> PosixRegexMatcher<'a> {
             if branches.is_empty() ||
                     // The internal start thing is lazy, not greedy:
                     (succeeded.is_some() && branches.iter().all(|t| t.node().token == Token::InternalStart)) {
-                return succeeded.map(|branch| branch.prev);
+                return succeeded;
             }
 
             if next.is_some() {

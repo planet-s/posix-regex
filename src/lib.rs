@@ -26,6 +26,7 @@ mod std {
 
 pub mod compile;
 pub mod ctype;
+pub mod immut_vec;
 pub mod matcher;
 pub mod tree;
 
