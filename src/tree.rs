@@ -23,7 +23,6 @@ impl From<NodeId> for usize {
 pub struct Node {
     pub token: Token,
     pub range: Range,
-    pub end: bool,
     pub parent: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
     pub child: Option<NodeId>
@@ -36,9 +35,6 @@ impl Node {
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?} {:?}", self.token, self.range)?;
-        if self.end {
-            write!(f, " ending")?;
-        }
         Ok(())
     }
 }
@@ -72,7 +68,6 @@ impl TreeBuilder {
         self.arena.push(Node {
             token,
             range,
-            end: false,
             parent: self.parent,
             next_sibling: None,
             child: None
@@ -107,7 +102,6 @@ impl TreeBuilder {
             self.arena.push(Node {
                 token,
                 range,
-                end: false,
                 parent: self.parent,
                 next_sibling: None,
                 child: self.arena[usize::from(from)].next_sibling
@@ -119,7 +113,6 @@ impl TreeBuilder {
             self.arena.push(Node {
                 token,
                 range,
-                end: false,
                 parent: self.parent,
                 next_sibling: None,
                 child: self.arena[usize::from(parent)].child
@@ -131,7 +124,6 @@ impl TreeBuilder {
             self.arena.push(Node {
                 token,
                 range,
-                end: false,
                 parent: None,
                 next_sibling: None,
                 child: self.cursor
@@ -163,70 +155,6 @@ impl TreeBuilder {
 pub struct Tree {
     pub arena: Box<[Node]>,
     pub root: NodeId
-}
-impl Tree {
-    fn mark_end_of(&mut self, root: NodeId) {
-        // abc(de)? = (, )
-        // (ab)?c(de)? = (, )
-        // ab?c? = b, c
-        // ab?(c*) = b, c
-        //
-        // Algorithm: Find the first in a series of trailing optional nodes and
-        // mark all the nodes afterwards as endings as well, recursing any
-        // optional groups.
-        let mut next = Some(root);
-        while let Some(alternation) = next {
-            next = self.arena[usize::from(alternation)].next_sibling;
-
-            let mut end = None;
-            let mut next = self[alternation].child;
-            let mut nested: usize = 0;
-            'outer: while let Some(id) = next {
-                let node = &self[id];
-
-                // Mark the first optional node, or reset if it's not optional
-                let Range(min, _) = node.range;
-                if min == 0 {
-                    end = end.or(Some(id));
-                } else {
-                    if node.child.is_some() {
-                        // Recurse required groups
-                        nested += 1;
-                        next = node.child;
-                        continue;
-                    } else {
-                        end = None;
-                    }
-                }
-                let mut me = Some(node);
-                while me.map(|me| me.next_sibling.is_none()).unwrap_or(false) {
-                    match nested.checked_sub(1) {
-                        Some(new) => nested = new,
-                        None => break 'outer
-                    }
-                    me = me.unwrap().parent.map(|id| &self[id]);
-                }
-                next = me.and_then(|me| me.next_sibling);
-            }
-
-            // Mark all nodes after end as optional
-            let mut next = end;
-            while let Some(node) = next {
-                let node = &mut self[node];
-                next = node.next_sibling;
-                node.end = true;
-                if let Some(child) = node.child {
-                    // Find any ends if this node ends up expanded
-                    self.mark_end_of(child);
-                }
-            }
-        }
-    }
-    pub fn mark_end(&mut self) {
-        if let Some(alternative) = self[self.root].child {
-            self.mark_end_of(alternative);
-        }
-    }
 }
 impl Index<NodeId> for Tree {
     type Output = Node;
@@ -268,7 +196,6 @@ impl fmt::Debug for Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compile::PosixRegexBuilder;
 
     fn sanity_check(tree: &Tree) {
         let mut next = Some(tree.root);
@@ -359,28 +286,6 @@ Root 1..1
         . 1..1
   Alternative 1..1
     $ 1..1
-"
-        );
-    }
-    #[test]
-    fn mark_end() {
-        let tree = PosixRegexBuilder::new(br"a\?bc\?\(d*\)\|bb\?").compile_tokens().unwrap();
-        sanity_check(&tree);
-
-        assert_eq!(
-            format!("{:?}", tree),
-            "\
-Root 1..1
-  Alternative 1..1
-    'a' 0..1
-    'b' 1..1
-    'c' 0..1 ending
-    Group(1) 1..1 ending
-      Alternative 1..1
-        'd' 0.. ending
-  Alternative 1..1
-    'b' 1..1
-    'b' 0..1 ending
 "
         );
     }

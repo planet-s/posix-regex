@@ -158,9 +158,7 @@ impl<'a> PosixRegexBuilder<'a> {
         self.builder.start_internal(Token::Root, Range(1, Some(1)));
         self.parse()?;
         self.builder.finish_internal();
-        let mut tree = self.builder.finish();
-        tree.mark_end();
-        Ok(tree)
+        Ok(self.builder.finish())
     }
 
     fn consume(&mut self, amount: usize) {
@@ -444,7 +442,7 @@ Root 1..1
     'y' 1..1
     'e' 1..1
     'e' 1..1
-    'e' 0.. ending
+    'e' 0..
 "
         );
         assert_eq!(
@@ -454,7 +452,7 @@ Root 1..1
   Alternative 1..1
     'y' 1..1
     'e' 1..1
-    'e' 0..1 ending
+    'e' 0..1
 "
         );
         assert_eq!(

@@ -130,7 +130,6 @@ impl<'a> PosixRegex<'a> {
         arena.push(TreeNode {
             token: Token::Group(0),
             range: Range(1, Some(1)),
-            end: false,
             parent: None,
             next_sibling: None,
             child: root
@@ -149,7 +148,6 @@ impl<'a> PosixRegex<'a> {
         arena.push(TreeNode {
             token: Token::InternalStart,
             range: Range(0, None),
-            end: false,
             parent: None,
             next_sibling: Some(group_id),
             child: None
@@ -235,6 +233,11 @@ impl<'a> Node<'a> {
                     index: 0,
                     len: end - start
                 });
+                if start == end {
+                    // Empty group, mark as repeated enough times
+                    let Range(min, _) = me.node().range;
+                    me.repeated += min;
+                }
             }
         }
         me
@@ -257,9 +260,11 @@ impl<'a> Node<'a> {
             _ => return
         };
         self.repeated += 1;
-        let parent = Rc::new(self);
+        let mut parent = Rc::new(self);
+        let mut empty = true;
         for alternative in parent.tree[parent.node].children(&parent.tree) {
             if let Some(node) = parent.tree[alternative].child {
+                empty = false;
                 branches.push(Self::prepare(Self {
                     tree: parent.tree,
                     parent: Some(Rc::clone(&parent)),
@@ -273,6 +278,17 @@ impl<'a> Node<'a> {
                     backref: None
                 }));
             }
+        }
+        if empty {
+            let mut parent = Rc::get_mut(&mut parent).expect("group empty but still there's a dangling reference");
+            for &open in &[true, false] {
+                parent.prev = parent.prev.push(GroupEvent {
+                    open,
+                    id,
+                    offset
+                });
+            }
+            parent.add_branches(branches, offset);
         }
     }
     /// Get the internal token node without additional state metadata
@@ -400,9 +416,8 @@ impl<'a> Node<'a> {
             }
         }
     }
-    /// Returns true if this node is "finished", meaning it's reached one
-    /// possible end and continuing exploring is optional
-    fn is_finished(&self) -> bool {
+    /// Returns true if this node is the final node in the branch
+    fn is_final(&self) -> bool {
         let Range(min, _) = self.node().range;
         if self.repeated < min {
             return false;
@@ -427,10 +442,7 @@ impl<'a> Node<'a> {
             }
             next = current.parent.as_ref().map(|node| &**node);
         }
-        next
-            .and_then(|node| self.tree[node.node].next_sibling)
-            .map(|node| self.tree[node].end)
-            .unwrap_or(true)
+        next.and_then(|node| self.tree[node.node].next_sibling).is_none()
     }
 }
 
@@ -521,7 +533,7 @@ impl<'a> PosixRegexMatcher<'a> {
                                 branch.increment();
                                 branch.add_branches(&mut insert, self.offset);
                             }
-                            if branch.is_finished() {
+                            if branch.is_final() {
                                 succeeded = Some(branch.get_capturing_groups(self.max_groups, self.offset));
                             }
                             remove += 1;
@@ -586,7 +598,7 @@ impl<'a> PosixRegexMatcher<'a> {
                 if accepts {
                     branch.increment();
                 } else {
-                    if branch.is_finished() {
+                    if branch.is_final() {
                         let groups = branch.get_capturing_groups(self.max_groups, self.offset);
 
                         let mut add = true;
@@ -772,6 +784,10 @@ mod tests {
             matches_exact(r"\(a\|\(b\)\)*\(c\)", "aaac"),
             Some(abox![Some((0, 4)), Some((2, 3)), None, Some((3, 4))])
         );
+        assert_eq!(
+            matches_exact(r"a\(\)bc", "abc"),
+            Some(abox![Some((0, 3)), Some((1, 1))])
+        );
     }
     #[test]
     fn matches_is_lazy() {
@@ -859,8 +875,14 @@ mod tests {
         assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "abcbcd").is_none());
         assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "ababd").is_some());
         assert!(matches_exact(r"\([abc]\{2,3\}\)\1d", "abacd").is_none());
+
         assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellohd").is_some());
         assert!(matches_exact(r"\([[:alpha:]]\).*\1d", "hellod").is_none());
+        assert!(matches_exact(r"\([[:alpha:]]\).*\1", "hello").is_none());
+        assert!(matches_exact(r"\([[:alpha:]]\).*\1", "helloh").is_some());
+
+        assert!(matches_exact(r"\(\)-\?\1d", "d").is_some());
+        assert!(matches_exact(r"\(\)-\?\1", "").is_some());
 
         // Just make sure this doesn't crash it (even though it should error
         // but I'm too lazy)
