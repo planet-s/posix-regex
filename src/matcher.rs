@@ -257,7 +257,7 @@ impl<'a> Node<'a> {
     /// Create a new node. This is only called from the main function to start each alternative path
     fn new(tree: &'a Tree, node: NodeId, prev: ImmutVec<'a, GroupEvent>) -> Self {
         Self::prepare(Self {
-            tree: tree,
+            tree,
             parent: None,
             node,
             prev,
@@ -317,15 +317,12 @@ impl<'a> Node<'a> {
         while let Some(group) = parent {
             let group = &self.tree[group];
             parent = group.parent;
-            match group.token {
-                Token::Group(id) => {
-                    prev = prev.push(GroupEvent {
-                        open: false,
-                        id,
-                        offset,
-                    })
-                }
-                _ => (),
+            if let Token::Group(id) = group.token {
+                prev = prev.push(GroupEvent {
+                    open: false,
+                    id,
+                    offset,
+                })
             }
         }
 
