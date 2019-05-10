@@ -4,7 +4,7 @@ use std::prelude::*;
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
-use compile::{Token, Range};
+use compile::{Range, Token};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(usize);
@@ -25,7 +25,7 @@ pub struct Node {
     pub range: Range,
     pub parent: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
-    pub child: Option<NodeId>
+    pub child: Option<NodeId>,
 }
 impl Node {
     pub fn children<'a>(&self, arena: &'a Tree) -> NodeIter<'a> {
@@ -53,14 +53,14 @@ impl<'a> Iterator for NodeIter<'a> {
 }
 
 pub struct Checkpoint {
-    cursor: Option<NodeId>
+    cursor: Option<NodeId>,
 }
 
 #[derive(Default)]
 pub struct TreeBuilder {
     arena: Vec<Node>,
     parent: Option<NodeId>,
-    cursor: Option<NodeId>
+    cursor: Option<NodeId>,
 }
 impl TreeBuilder {
     fn insert(&mut self, token: Token, range: Range) -> NodeId {
@@ -70,13 +70,14 @@ impl TreeBuilder {
             range,
             parent: self.parent,
             next_sibling: None,
-            child: None
+            child: None,
         });
         if let Some(prev) = self.cursor {
             self.arena[usize::from(prev)].next_sibling = Some(id);
         }
         if let Some(parent) = self.parent {
-            self.arena[usize::from(parent)].child = self.arena[usize::from(parent)].child.or(Some(id));
+            self.arena[usize::from(parent)].child =
+                self.arena[usize::from(parent)].child.or(Some(id));
         }
         id
     }
@@ -89,11 +90,13 @@ impl TreeBuilder {
     }
     pub fn finish_internal(&mut self) {
         self.cursor = self.parent;
-        self.parent = self.parent.and_then(|parent| self.arena[usize::from(parent)].parent);
+        self.parent = self
+            .parent
+            .and_then(|parent| self.arena[usize::from(parent)].parent);
     }
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
-            cursor: self.cursor
+            cursor: self.cursor,
         }
     }
     pub fn start_internal_at(&mut self, checkpoint: Checkpoint, token: Token, range: Range) {
@@ -104,7 +107,7 @@ impl TreeBuilder {
                 range,
                 parent: self.parent,
                 next_sibling: None,
-                child: self.arena[usize::from(from)].next_sibling
+                child: self.arena[usize::from(from)].next_sibling,
             });
             self.arena[usize::from(from)].next_sibling = Some(id);
             id
@@ -115,7 +118,7 @@ impl TreeBuilder {
                 range,
                 parent: self.parent,
                 next_sibling: None,
-                child: self.arena[usize::from(parent)].child
+                child: self.arena[usize::from(parent)].child,
             });
             self.arena[usize::from(parent)].child = Some(id);
             id
@@ -126,7 +129,7 @@ impl TreeBuilder {
                 range,
                 parent: None,
                 next_sibling: None,
-                child: self.cursor
+                child: self.cursor,
             });
             id
         };
@@ -146,7 +149,7 @@ impl TreeBuilder {
 
         Tree {
             arena: self.arena.into_boxed_slice(),
-            root: cursor
+            root: cursor,
         }
     }
 }
@@ -154,7 +157,7 @@ impl TreeBuilder {
 #[derive(Clone)]
 pub struct Tree {
     pub arena: Box<[Node]>,
-    pub root: NodeId
+    pub root: NodeId,
 }
 impl Index<NodeId> for Tree {
     type Output = Node;
@@ -182,7 +185,7 @@ impl fmt::Debug for Tree {
                 while me.map(|me| me.next_sibling.is_none()).unwrap_or(false) {
                     match nested.checked_sub(1) {
                         Some(new) => nested = new,
-                        None => break 'outer
+                        None => break 'outer,
                     }
                     me = me.unwrap().parent.map(|id| &self[id]);
                 }
@@ -209,7 +212,10 @@ mod tests {
                 parent = Some(id);
             } else {
                 let mut node = Some(id);
-                while node.map(|node| tree[node].next_sibling.is_none()).unwrap_or(false) {
+                while node
+                    .map(|node| tree[node].next_sibling.is_none())
+                    .unwrap_or(false)
+                {
                     node = tree[node.unwrap()].parent;
                 }
                 next = node.and_then(|node| tree[node].next_sibling);
@@ -222,17 +228,17 @@ mod tests {
     fn simple_builder() {
         let mut builder = TreeBuilder::default();
         builder.start_internal(Token::Root, Range(1, Some(1)));
-            builder.start_internal(Token::Alternative, Range(1, Some(1)));
-                builder.leaf(Token::Start, Range(1, Some(1)));
-                builder.start_internal(Token::Group(1), Range(1, Some(1)));
-                    builder.start_internal(Token::Alternative, Range(1, Some(1)));
-                        builder.leaf(Token::Any, Range(1, Some(1)));
-                    builder.finish_internal();
-                builder.finish_internal();
-            builder.finish_internal();
-            builder.start_internal(Token::Alternative, Range(1, Some(1)));
-                builder.leaf(Token::End, Range(1, Some(1)));
-            builder.finish_internal();
+        builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        builder.leaf(Token::Start, Range(1, Some(1)));
+        builder.start_internal(Token::Group(1), Range(1, Some(1)));
+        builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        builder.leaf(Token::Any, Range(1, Some(1)));
+        builder.finish_internal();
+        builder.finish_internal();
+        builder.finish_internal();
+        builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        builder.leaf(Token::End, Range(1, Some(1)));
+        builder.finish_internal();
         builder.finish_internal();
 
         let tree = builder.finish();
@@ -256,20 +262,20 @@ Root 1..1
     fn builder_checkpoint() {
         let mut builder = TreeBuilder::default();
         builder.start_internal(Token::Root, Range(1, Some(1)));
-            let mut alternation = builder.checkpoint();
-                builder.leaf(Token::Start, Range(1, Some(1)));
-                let group = builder.checkpoint();
-                    builder.start_internal(Token::Alternative, Range(1, Some(1)));
-                        builder.leaf(Token::Any, Range(1, Some(1)));
-                    builder.finish_internal();
-                builder.start_internal_at(group, Token::Group(1), Range(1, Some(1)));
-                builder.finish_internal();
-            builder.start_internal_at(alternation, Token::Alternative, Range(1, Some(1)));
-            builder.finish_internal();
-            alternation = builder.checkpoint();
-                builder.leaf(Token::End, Range(1, Some(1)));
-            builder.start_internal_at(alternation, Token::Alternative, Range(1, Some(1)));
-            builder.finish_internal();
+        let mut alternation = builder.checkpoint();
+        builder.leaf(Token::Start, Range(1, Some(1)));
+        let group = builder.checkpoint();
+        builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        builder.leaf(Token::Any, Range(1, Some(1)));
+        builder.finish_internal();
+        builder.start_internal_at(group, Token::Group(1), Range(1, Some(1)));
+        builder.finish_internal();
+        builder.start_internal_at(alternation, Token::Alternative, Range(1, Some(1)));
+        builder.finish_internal();
+        alternation = builder.checkpoint();
+        builder.leaf(Token::End, Range(1, Some(1)));
+        builder.start_internal_at(alternation, Token::Alternative, Range(1, Some(1)));
+        builder.finish_internal();
         builder.finish_internal();
 
         let tree = builder.finish();

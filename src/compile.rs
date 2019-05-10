@@ -7,8 +7,8 @@ use std::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use {ctype, PosixRegex};
 use tree::*;
+use {ctype, PosixRegex};
 
 /// Repetition bounds, for example + is (1, None), and ? is (0, Some(1))
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,19 +26,21 @@ impl fmt::Debug for Range {
 #[derive(Clone, PartialEq, Eq)]
 pub enum Collation {
     Char(u8),
-    Class(fn(u8) -> bool)
+    Class(fn(u8) -> bool),
 }
 impl Collation {
     /// Compare this collation to a character
     pub fn matches(&self, other: u8, insensitive: bool) -> bool {
         match *self {
-            Collation::Char(me) if insensitive => if ctype::is_alpha(me) && ctype::is_alpha(other) {
-                me | 32 == other | 32
-            } else {
-                me == other
-            },
+            Collation::Char(me) if insensitive => {
+                if ctype::is_alpha(me) && ctype::is_alpha(other) {
+                    me | 32 == other | 32
+                } else {
+                    me == other
+                }
+            }
             Collation::Char(me) => me == other,
-            Collation::Class(f) => f(other)
+            Collation::Class(f) => f(other),
         }
     }
 }
@@ -65,12 +67,12 @@ pub enum Token {
     Group(usize),
     OneOf {
         invert: bool,
-        list: Vec<Collation>
+        list: Vec<Collation>,
     },
     Root,
     Start,
     WordEnd,
-    WordStart
+    WordStart,
 }
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -87,7 +89,7 @@ impl fmt::Debug for Token {
             Token::Root => write!(f, "Root"),
             Token::Start => write!(f, "^"),
             Token::WordEnd => write!(f, ">"),
-            Token::WordStart => write!(f, "<")
+            Token::WordStart => write!(f, "<"),
         }
     }
 }
@@ -104,7 +106,7 @@ pub enum Error {
     UnclosedRepetition,
     UnexpectedToken(u8),
     UnknownClass(Vec<u8>),
-    UnknownCollation
+    UnknownCollation,
 }
 
 /// A regex builder struct
@@ -112,7 +114,7 @@ pub struct PosixRegexBuilder<'a> {
     input: &'a [u8],
     classes: HashMap<&'a [u8], fn(u8) -> bool>,
     group_id: usize,
-    builder: TreeBuilder
+    builder: TreeBuilder,
 }
 impl<'a> PosixRegexBuilder<'a> {
     /// Create a new instance that is ready to parse the regex `input`
@@ -121,7 +123,7 @@ impl<'a> PosixRegexBuilder<'a> {
             input,
             classes: HashMap::new(),
             group_id: 1,
-            builder: TreeBuilder::default()
+            builder: TreeBuilder::default(),
         }
     }
     /// Add a custom collation class, for use within square brackets (such as `[[:digit:]]`)
@@ -168,16 +170,22 @@ impl<'a> PosixRegexBuilder<'a> {
         let mut out: Option<u32> = None;
         while let Some(&c @ b'0'..=b'9') = self.input.first() {
             self.consume(1);
-            out = Some(out.unwrap_or(0)
-                .checked_mul(10)
-                .and_then(|out| out.checked_add((c - b'0') as u32))
-                .ok_or(Error::IntegerOverflow)?);
+            out = Some(
+                out.unwrap_or(0)
+                    .checked_mul(10)
+                    .and_then(|out| out.checked_add((c - b'0') as u32))
+                    .ok_or(Error::IntegerOverflow)?,
+            );
         }
         Ok(out)
     }
     fn next(&mut self) -> Result<u8, Error> {
-        self.input.first()
-            .map(|&c| { self.consume(1); c })
+        self.input
+            .first()
+            .map(|&c| {
+                self.consume(1);
+                c
+            })
             .ok_or(Error::EOF)
     }
     fn expect(&mut self, c: u8) -> Result<(), Error> {
@@ -215,10 +223,10 @@ impl<'a> PosixRegexBuilder<'a> {
                         }
                         range = Range(first, second);
                         None
-                    },
-                    _ => None
+                    }
+                    _ => None,
                 },
-                _ => None
+                _ => None,
             };
             if let Some((consume, new)) = new {
                 range = new;
@@ -228,7 +236,8 @@ impl<'a> PosixRegexBuilder<'a> {
         Ok(range)
     }
     fn parse(&mut self) -> Result<(), Error> {
-        self.builder.start_internal(Token::Alternative, Range(1, Some(1)));
+        self.builder
+            .start_internal(Token::Alternative, Range(1, Some(1)));
         while let Ok(c) = self.next() {
             let token = match c {
                 b'^' => Token::Start,
@@ -256,33 +265,41 @@ impl<'a> PosixRegexBuilder<'a> {
                                     c = self.next()?;
                                     self.expect(b'.')?;
                                     self.expect(b']')?;
-                                },
+                                }
                                 b'=' => {
                                     c = self.next()?;
                                     self.expect(b'=')?;
                                     self.expect(b']')?;
-                                },
+                                }
                                 b':' => {
-                                    let end = self.input.iter().position(|&c| c == b':').ok_or(Error::EOF)?;
+                                    let end = self
+                                        .input
+                                        .iter()
+                                        .position(|&c| c == b':')
+                                        .ok_or(Error::EOF)?;
                                     let key = &self.input[..end];
-                                    let class = *self.classes.get(key).ok_or_else(|| Error::UnknownClass(key.to_vec()))?;
+                                    let class = *self
+                                        .classes
+                                        .get(key)
+                                        .ok_or_else(|| Error::UnknownClass(key.to_vec()))?;
                                     self.consume(end + 1);
                                     self.expect(b']')?;
 
                                     list.push(Collation::Class(class));
                                     push = false;
-                                },
-                                _ => return Err(Error::UnknownCollation)
+                                }
+                                _ => return Err(Error::UnknownCollation),
                             }
                         }
 
                         if push {
                             list.push(Collation::Char(c));
 
-                            if self.input.first() == Some(&b'-') && self.input.get(1) != Some(&b']') {
+                            if self.input.first() == Some(&b'-') && self.input.get(1) != Some(&b']')
+                            {
                                 self.consume(1);
                                 let dest = self.next()?;
-                                for c in (c+1)..=dest {
+                                for c in (c + 1)..=dest {
                                     list.push(Collation::Char(c));
                                 }
                             }
@@ -294,12 +311,15 @@ impl<'a> PosixRegexBuilder<'a> {
                         }
                     }
 
-                    Token::OneOf {
-                        invert,
-                        list
-                    }
-                },
-                b'\\' if self.input.first().map(|&c| (c as char).is_digit(10)).unwrap_or(false) => {
+                    Token::OneOf { invert, list }
+                }
+                b'\\'
+                    if self
+                        .input
+                        .first()
+                        .map(|&c| (c as char).is_digit(10))
+                        .unwrap_or(false) =>
+                {
                     let id = self.take_int()?.unwrap();
                     if (id as usize) >= self.group_id {
                         return Err(Error::InvalidBackRef(id));
@@ -313,28 +333,42 @@ impl<'a> PosixRegexBuilder<'a> {
                         let checkpoint = self.builder.checkpoint();
                         self.parse()?;
                         let range = self.parse_range()?;
-                        self.builder.start_internal_at(checkpoint, Token::Group(id), range);
+                        self.builder
+                            .start_internal_at(checkpoint, Token::Group(id), range);
                         self.builder.finish_internal();
                         continue;
-                    },
+                    }
                     b')' => break,
                     b'|' => {
                         self.builder.finish_internal();
-                        self.builder.start_internal(Token::Alternative, Range(1, Some(1)));
+                        self.builder
+                            .start_internal(Token::Alternative, Range(1, Some(1)));
                         continue;
-                    },
+                    }
                     b'<' => Token::WordStart,
                     b'>' => Token::WordEnd,
-                    b'a' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_alnum)] },
-                    b'd' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_digit)] },
-                    b's' => Token::OneOf { invert: false, list: vec![Collation::Class(ctype::is_space)] },
-                    b'S' => Token::OneOf { invert: true,  list: vec![Collation::Class(ctype::is_space)] },
+                    b'a' => Token::OneOf {
+                        invert: false,
+                        list: vec![Collation::Class(ctype::is_alnum)],
+                    },
+                    b'd' => Token::OneOf {
+                        invert: false,
+                        list: vec![Collation::Class(ctype::is_digit)],
+                    },
+                    b's' => Token::OneOf {
+                        invert: false,
+                        list: vec![Collation::Class(ctype::is_space)],
+                    },
+                    b'S' => Token::OneOf {
+                        invert: true,
+                        list: vec![Collation::Class(ctype::is_space)],
+                    },
                     b'n' => Token::Char(b'\n'),
                     b'r' => Token::Char(b'\r'),
                     b't' => Token::Char(b'\t'),
-                    c => Token::Char(c)
+                    c => Token::Char(c),
                 },
-                c => Token::Char(c)
+                c => Token::Char(c),
             };
             let range = self.parse_range()?;
             self.builder.leaf(token, range);
@@ -545,11 +579,15 @@ Root 1..1
         );
         assert_eq!(
             compile(b"[[:digit:][:upper:]]"),
-            format!("\
+            format!(
+                "\
 Root 1..1
   Alternative 1..1
     {{invert: false, [{:p}, {:p}]}} 1..1
-", ctype::is_digit as fn(u8) -> bool, ctype::is_upper as fn(u8) -> bool)
+",
+                ctype::is_digit as fn(u8) -> bool,
+                ctype::is_upper as fn(u8) -> bool
+            )
         );
     }
     #[test]
