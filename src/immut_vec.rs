@@ -5,27 +5,24 @@ use std::cell::RefCell;
 
 pub struct ImmutVecItem<T> {
     prev: Option<usize>,
-    data: T
+    data: T,
 }
 pub struct ImmutVec<'a, T> {
     inner: &'a RefCell<Vec<ImmutVecItem<T>>>,
-    id: Option<usize>
+    id: Option<usize>,
 }
 impl<'a, T> Copy for ImmutVec<'a, T> {}
 impl<'a, T> Clone for ImmutVec<'a, T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner,
-            id: self.id
+            id: self.id,
         }
     }
 }
 impl<'a, T> ImmutVec<'a, T> {
     pub fn new(inner: &'a RefCell<Vec<ImmutVecItem<T>>>) -> Self {
-        Self {
-            inner,
-            id: None
-        }
+        Self { inner, id: None }
     }
     #[must_use = "push does nothing to the original vector"]
     pub fn push(self, item: T) -> Self {
@@ -33,7 +30,7 @@ impl<'a, T> ImmutVec<'a, T> {
         let id = inner.len();
         inner.push(ImmutVecItem {
             prev: self.id,
-            data: item
+            data: item,
         });
         Self {
             id: Some(id),
@@ -47,13 +44,16 @@ impl<'a, T: Clone> ImmutVec<'a, T> {
         let inner = self.inner.borrow();
         let id = match self.id {
             None => return (self, None),
-            Some(id) => id
+            Some(id) => id,
         };
         let item = &inner[id];
-        (Self {
-            id: item.prev,
-            ..self
-        }, Some(item.data.clone()))
+        (
+            Self {
+                id: item.prev,
+                ..self
+            },
+            Some(item.data.clone()),
+        )
     }
     pub fn iter_rev(self) -> ImmutVecIter<'a, T> {
         ImmutVecIter(self)
